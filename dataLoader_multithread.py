@@ -6,7 +6,7 @@ import spatialdata as sd
 from spatialdata_io import xenium
 import pandas as pd
 
-def xenium_data_load_multithreaded_optimized(data_dir, sample_info, max_workers=4, n_jobs_per_sample=4):
+def xenium_data_load_multithreaded(data_dir, sample_info, max_workers=4, n_jobs_per_sample=4):
     """
     优化的多线程读取多个 Xenium 样本数据
     
