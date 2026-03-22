@@ -6,7 +6,7 @@
 
 ### 步骤1
 
-下载 scRNA（有 cell type）
+下载人类肺部细胞 scRNA（有 cell type）
 
 ```bash
 # 完整版
@@ -18,7 +18,7 @@ curl -O https://datasets.cellxgene.cziscience.com/4cb45d80-499a-48ae-a056-c71ac3
 
 ### 步骤2
 
-下载 Xenium（没有 cell type）
+下载人类肺癌数据集 Xenium（没有 cell type）
 
 ```bash
 curl -O https://cf.10xgenomics.com/samples/xenium/3.0.0/Xenium_V1_Human_Lung_Cancer_FFPE/Xenium_V1_Human_Lung_Cancer_FFPE_outs.zip
@@ -27,6 +27,7 @@ curl -O https://cf.10xgenomics.com/samples/xenium/3.0.0/Xenium_V1_Human_Lung_Can
 ### 步骤3
 
 找到两者共有的基因
+因为两个数据的基因不完全一样，只能用共同基因训练模型
 
 ### 步骤4
 
