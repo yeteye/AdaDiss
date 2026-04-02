@@ -1,7 +1,14 @@
 # ============================================
-# 修正版: 数据加载与空间图构建
+# 最重要：必须在 import torch 之前设置
 # ============================================
+import os
 
+# 在导入任何 CUDA 相关库之前设置
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 使用 GPU 1
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# 然后再导入 PyTorch 和其他库
+import gc
 import pandas as pd
 import numpy as np
 import torch
@@ -32,6 +39,14 @@ np.random.seed(42)
 # 设置设备
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
+
+# 打印 GPU 信息
+if torch.cuda.is_available():
+    print(f"CUDA 版本: {torch.version.cuda}")
+    print(f"当前使用 GPU: {torch.cuda.current_device()}")
+    print(f"GPU 名称: {torch.cuda.get_device_name()}")
+    print(f"总显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    print(f"当前可用显存: {torch.cuda.mem_get_info()[0] / 1024**3:.2f} GB")
 
 # ============================================
 # 1. 加载数据
