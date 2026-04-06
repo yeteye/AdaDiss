@@ -209,4 +209,5 @@ __marimo__/
 
 data/
 results/
-model/
+models/
+figures/
