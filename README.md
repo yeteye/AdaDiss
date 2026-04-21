@@ -1,46 +1,49 @@
-# AdaDiss
+# 项目结构说明
 
-本科生毕业论文项目
-
-## 实现思路
-
-### 步骤1
-
-下载人类肺部细胞 scRNA（有 cell type）
-
-```bash
-# 完整版
-curl -O https://datasets.cellxgene.cziscience.com/dbb5ad81-1713-4aee-8257-396fbabe7c6e.h5ad
-
-# 核心版
-curl -O https://datasets.cellxgene.cziscience.com/4cb45d80-499a-48ae-a056-c71ac3552c94.h5ad
+```
+project/
+├── train.ipynb       # 主训练流程（10 个 Cell）
+├── models.py         # GCN / GraphSAGE / GAT + 训练循环（含 DA）
+├── topact.py         # TopACT baseline + Moran's I
+├── eval.py           # Fig 1–10 论文图表生成
+└── utils.py          # 预处理 / 图构建 / DA 损失函数
 ```
 
-### 步骤2
+## 修复清单
 
-下载人类肺癌数据集 Xenium（没有 cell type）
+| 级别 | 编号 | 问题 | 修复位置 |
+|------|------|------|---------|
+| P0 | ① | 双重独立归一化 | `utils.unified_normalize()` |
+| P0 | ② | state_dict 浅拷贝 | `utils.save_best_state()` → deepcopy |
+| P0 | ③ | 有向图未对称 | `utils.build_mutual_knn_graph()` + `to_undirected` |
+| P0 | ④ | Seurat 标签评估风险 | `train.ipynb` Cell 10（独立可选 cell）|
+| P1 | ⑤ | 缺 DA 机制 | `utils.mmd_loss` + `entropy_regularization` + 伪标签 |
+| P1 | ⑥ | 无生物预处理 | `utils.log_normalize()` |
+| P1 | ⑦ | 无类别权重 | `utils.build_combined_dataset()` → class_weights |
+| P1 | ⑧ | 验证集未分层 | `StratifiedShuffleSplit` |
+| P2 | ⑨ | 无 LR 调度器 | `ReduceLROnPlateau` in `models.run_experiment()` |
+| P2 | ⑩ | 无梯度裁剪 | `clip_grad_norm_` in `models.train_epoch()` |
+| P2 | ⑪ | 无 BatchNorm | `BatchNorm1d` in `GCN/GraphSAGE/GAT` |
+| P3 | ⑫ | 无伪标签 | `utils.get_pseudo_labels()` in `models.train_epoch()` |
+| P3 | ⑬ | 普通 kNN | Mutual kNN + `to_undirected` |
+| P3 | ⑭ | 维度跨度大 | `proj_dim=512` 投影层（可选）|
 
-```bash
-curl -O https://cf.10xgenomics.com/samples/xenium/3.0.0/Xenium_V1_Human_Lung_Cancer_FFPE/Xenium_V1_Human_Lung_Cancer_FFPE_outs.zip
-```
+## 论文图表清单
 
-### 步骤3
+| 图号 | 内容 | 说明 |
+|------|------|------|
+| Fig 1 | scRNA UMAP | 参考集细胞类型分布 |
+| Fig 2 | GNN 隐层 UMAP | 域适应效果 + 类型可分性 |
+| Fig 3 | 训练曲线 | Loss 分量 + Val F1 |
+| Fig 4 | 方法对比柱状图 | Acc / F1 / Kappa |
+| Fig 5 | 混淆矩阵 | 每方法一张，行归一化 |
+| Fig 6 | 空间预测图 | 4-panel 空间散点图 |
+| Fig 7 | 细胞类型比例 | scRNA vs 各模型堆叠条形 |
+| Fig 8 | 逐类 F1 热力图 | 稀有类型性能对比 |
+| Fig 9 | 置信度分布 | 小提琴 + CDF |
+| Fig 10 | Moran's I | 空间自相关按细胞类型 |
 
-找到两者共有的基因
-因为两个数据的基因不完全一样，只能用共同基因训练模型
+## 运行顺序
 
-### 步骤4
-
-在 scRNA 上训练分类器
-
-### 步骤5
-
-用分类器预测 Xenium 的 cell type
-
-### 步骤6
-
-得到 Xenium 的 pseudo label
-
-### 步骤7
-
-用 pseudo label 训练 GNN
+1. 先运行 `labelTransfer.ipynb`（R 预处理，生成 cache/）
+2. 运行 `train.ipynb`（Cell 1 → Cell 9，Cell 10 可选）
