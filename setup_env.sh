@@ -42,7 +42,7 @@ detect_cuda() {
         local ver
         ver=$(nvidia-smi | grep -oP "CUDA Version: \K[0-9]+\.[0-9]+" | head -1)
         major=$(echo "$ver" | cut -d. -f1)
-        if   [[ $major -ge 12 ]]; then echo "cu121"
+        if   [[ $major -ge 12 ]]; then echo "cu118"
         elif [[ $major -ge 11 ]]; then echo "cu118"
         else                           echo "cpu"
         fi
@@ -120,9 +120,9 @@ if [[ "${CUDA_TAG}" == "cpu" ]]; then
 else
     info "Installing GPU PyTorch (${CUDA_TAG})..."
     # conda-forge 的 pytorch-gpu 包含 CUDA 库，无需额外安装 cudatoolkit
-    conda install -n "${ENV_NAME}" -y -c conda-forge \
-        pytorch=2.3 torchvision pytorch-cuda="${CUDA_TAG#cu}"
-    # 注：conda-forge 使用 pytorch-cuda=12.1 格式
+    conda install -n "${ENV_NAME}" -y \
+        -c pytorch -c nvidia \
+        pytorch=2.3 torchvision pytorch-cuda=11.8 
     # 如果上面失败，退回 pip 安装（见注释）
 fi
 

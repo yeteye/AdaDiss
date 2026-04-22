@@ -49,14 +49,14 @@ dependencies:
 
   # ── PyTorch（CPU 版本；GPU 见下方注释）───────────────────────────────
   # CPU 模式（无 GPU / macOS）:
-  - pytorch=2.3
-  - torchvision
-  - cpuonly
-  #
-  # GPU 模式（CUDA 12.x）请注释掉上面 3 行，取消注释下面 3 行：
   # - pytorch=2.3
   # - torchvision
-  # - pytorch-cuda=12.1
+  # - cpuonly
+  #
+  # GPU 模式（CUDA 11.x）请注释掉上面 3 行，取消注释下面 3 行：
+  - pytorch=2.3
+  - torchvision
+  - pytorch-cuda=11.8
 
   # ── R + rpy2（%%R 魔法命令）──────────────────────────────────────────
   - rpy2=3.5
