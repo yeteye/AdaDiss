@@ -116,7 +116,7 @@ step "Step 3: 安装 PyTorch + torchvision"
 if [[ "${CUDA_TAG}" == "cpu" ]]; then
     info "Installing CPU-only PyTorch..."
     conda install -n "${ENV_NAME}" -y -c conda-forge \
-        pytorch=2.3 torchvision cpuonly
+        pytorch=2.7 torchvision cpuonly
 else
     info "Installing GPU PyTorch (${CUDA_TAG})..."
     # conda-forge 的 pytorch-gpu 包含 CUDA 库，无需额外安装 cudatoolkit
@@ -179,8 +179,7 @@ conda install -n "${ENV_NAME}" -y -c conda-forge \
     r-jsonlite \
     r-hdf5r \
     r-remotes \
-    r-arrow \
-    bioconductor-biocmanager
+    r-arrow 
 
 info "Installing Seurat-related R packages from source..."
 ${RUN} Rscript - <<'RSCRIPT'
