@@ -24,6 +24,7 @@ from torch_geometric.nn import GATConv
 from torch_geometric.data import Data
 
 from utils import mmd_loss, entropy_regularization, get_pseudo_labels, save_best_state
+from tqdm.auto import tqdm
 
 
 # ══════════════════════════════════════════════════════════
@@ -122,13 +123,14 @@ def run_gat_amp(
     gat_heads    = params.get("gat_heads", 4)
     use_ckpt     = params.get("use_ckpt",  False)
 
+    from gpu_utils import get_mem_info, vram_str
+    _m = get_mem_info(device)
+    _flags = f"AMP={'on' if use_amp else 'off'}  heads={gat_heads}  ckpt={'on' if use_ckpt else 'off'}"
     print(f"\n{'='*55}")
-    print(f"  GAT  (AMP={use_amp}  heads={gat_heads}  checkpoint={use_ckpt})")
-    print(f"  device: {device}")
-    if use_amp:
-        print(f"  混合精度开启 → 预计显存减少 ~45%")
-    if use_ckpt:
-        print(f"  梯度检查点开启 → 预计显存再减 ~30%（速度慢 20%）")
+    print(f"  GAT ({_flags})")
+    print(f"  GPU 空闲 {_m['free']:.1f}/{_m['total']:.0f} GB")
+    if use_amp:  print(f"  混合精度开启 → 显存减少 ~45%")
+    if use_ckpt: print(f"  梯度检查点开启 → 再减 ~30%，速度慢 20%")
     print(f"{'='*55}")
 
     model = GATMemEfficient(
@@ -167,7 +169,14 @@ def run_gat_amp(
     pseudo_mask_cache   = None
     pl_freq = params.get("pl_update_freq", 10)
 
-    for epoch in range(1, params["n_epochs"] + 1):
+    pbar = tqdm(
+        range(1, params["n_epochs"] + 1),
+        desc="GAT(AMP)",
+        unit="ep",
+        ncols=110,
+        colour="cyan",
+    )
+    for epoch in pbar:
         use_da = epoch > warmup
 
         # ── 更新伪标签 ────────────────────────────────────
@@ -182,8 +191,8 @@ def run_gat_amp(
             pseudo_labels_cache = pl.detach()
             pseudo_mask_cache   = pm.detach()
             if pm.sum() > 0:
-                print(f"  [Ep {epoch:3d}] 伪标签 {pm.sum():,} 个 "
-                      f"({100*pm.float().mean():.1f}%)")
+                tqdm.write(f"  [Ep {epoch:3d}] 伪标签更新：{pm.sum():,} 个 "
+                           f"({100*pm.float().mean():.1f}%)")
 
         # ── 训练一步 ──────────────────────────────────────
         model.train()
@@ -270,14 +279,18 @@ def run_gat_amp(
         else:
             patience_cnt += 1
 
-        if epoch % 20 == 0 or epoch <= 3:
-            vram = torch.cuda.memory_reserved(device) / 1024**3
-            print(f"  Ep {epoch:3d} | CE={loss_ce.item():.3f} "
-                  f"MMD={loss_mmd.item():.4f} | "
-                  f"ValF1={val_f1:.4f} | VRAM={vram:.1f}GB")
+        # ── 进度条 postfix（每 epoch 更新）────────────
+        pbar.set_postfix({
+            "CE":   f"{loss_ce.item():.3f}",
+            "MMD":  f"{loss_mmd.item():.4f}",
+            "F1":   f"{val_f1:.4f}",
+            "VRAM": vram_str(device),
+            "lr":   f"{optimizer.param_groups[0]['lr']:.1e}",
+            "pat":  f"{patience_cnt}/{params['patience']}",
+        }, refresh=True)
 
         if patience_cnt >= params["patience"]:
-            print(f"  Early stop @ ep {epoch}  best F1={best_val_f1:.4f}")
+            tqdm.write(f"  Early stop @ ep {epoch}  best F1={best_val_f1:.4f}")
             break
 
     # ── 加载最优权重 + 推断 ───────────────────────────────
@@ -291,7 +304,8 @@ def run_gat_amp(
     xen_labels = [cell_types[i] for i in xen_idx]
     xen_h      = h_final[data.xenium_mask].float().cpu().numpy()
 
-    print(f"\n  ✅ GAT (AMP) 训练完成  Best Val F1 = {best_val_f1:.4f}")
+    pbar.close()
+    print(f"\n  ✅ GAT(AMP) 完成  Best Val F1 = {best_val_f1:.4f}")
 
     return {
         "model_name":   "GAT",

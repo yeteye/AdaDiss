@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, SAGEConv, GATConv
 from torch_geometric.data import Data
 import numpy as np
+from tqdm.auto import tqdm
 
 from utils import (
     mmd_loss,
@@ -371,8 +372,10 @@ def run_experiment(
     params : 全局超参字典（见 train.ipynb）
     """
     device = params["device"]
+    from gpu_utils import get_mem_info, vram_str
+    _m = get_mem_info(device)
     print(f"\n{'='*55}")
-    print(f" {model_name}")
+    print(f"  {model_name}  |  GPU 空闲 {_m['free']:.1f}/{_m['total']:.0f} GB")
     print(f"{'='*55}")
 
     # ── 初始化 ───────────────────────────────────────────
@@ -412,7 +415,14 @@ def run_experiment(
     pseudo_mask_cache   = None
     pl_update_freq      = params.get("pl_update_freq", 10)
 
-    for epoch in range(1, params["n_epochs"] + 1):
+    pbar = tqdm(
+        range(1, params["n_epochs"] + 1),
+        desc=f"{model_name}",
+        unit="ep",
+        ncols=110,
+        colour="green",
+    )
+    for epoch in pbar:
 
         # ── 刷新伪标签 ─────────────────────────────────
         use_pl = epoch > warmup_epochs
@@ -427,8 +437,8 @@ def run_experiment(
             pseudo_mask_cache   = pm.detach()
             n_pl = pm.sum().item()
             if n_pl > 0:
-                print(f"  [Epoch {epoch:3d}] Pseudo-labels updated: {n_pl:,} cells "
-                      f"({100*n_pl/data.xenium_mask.sum().item():.1f}%)")
+                tqdm.write(f"  [Ep {epoch:3d}] 伪标签更新：{n_pl:,} 个 "
+                           f"({100*n_pl/data.xenium_mask.sum().item():.1f}%)")
 
         # ── 训练一步 ───────────────────────────────────
         losses = train_epoch(
@@ -458,24 +468,27 @@ def run_experiment(
         else:
             patience_cnt += 1
 
-        if (epoch % 20 == 0) or (epoch <= 5):
-            print(
-                f"  Ep {epoch:3d} | "
-                f"CE={losses['loss_ce']:.3f} MMD={losses['loss_mmd']:.4f} "
-                f"Ent={losses['loss_ent']:.4f} PL={losses['loss_pl']:.4f} | "
-                f"Val Acc={metrics['val_acc']:.3f} F1={metrics['val_f1_macro']:.3f} "
-                f"lr={log['lr']:.2e}"
-            )
+        # ── 更新进度条 postfix（每 epoch 都更新）─────────
+        _vram = vram_str(device)
+        pbar.set_postfix({
+            "CE":    f"{losses['loss_ce']:.3f}",
+            "MMD":   f"{losses['loss_mmd']:.4f}",
+            "F1":    f"{metrics['val_f1_macro']:.3f}",
+            "VRAM":  _vram,
+            "lr":    f"{log['lr']:.1e}",
+            "pat":   f"{patience_cnt}/{params['patience']}",
+        }, refresh=True)
 
         if patience_cnt >= params["patience"]:
-            print(f"  Early stopping at epoch {epoch} (best F1={best_val_f1:.4f})")
+            tqdm.write(f"  Early stop @ ep {epoch}  best F1={best_val_f1:.4f}")
             break
 
     # ── 加载最优权重 + 预测 ───────────────────────────────
     model.load_state_dict(best_state)
     preds = predict_xenium(model, data, cell_types)
 
-    print(f"  Best val F1-macro: {best_val_f1:.4f}")
+    pbar.close()
+    print(f"\n  ✅ {model_name} 完成  Best Val F1 = {best_val_f1:.4f}")
 
     return {
         "model_name":    model_name,
