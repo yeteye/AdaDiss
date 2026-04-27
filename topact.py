@@ -11,9 +11,12 @@ topact.py — TopACT Baseline（SVM + 空间平滑）
 
 import numpy as np
 from scipy.spatial.distance import cdist
-from sklearn.svm import SVC
+# from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
+# 替换为 cuML GPU 版本
+from cuml.svm import SVC          # GPU SVM，接口完全兼容
+from cuml.neighbors import NearestNeighbors  # GPU kNN
 
 
 class TopACT:
