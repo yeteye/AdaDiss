@@ -3,13 +3,16 @@ utils.py — 数据预处理 / 图构建 / Domain Adaptation 损失函数
 
 修复清单
 --------
-P0-①  双重独立归一化   → unified_normalize()，只在 scRNA 上 fit
-P0-②  state_dict 浅拷贝 → 调用方使用 copy.deepcopy()（此处提供辅助 save_best）
-P0-③  有向图未对称     → build_mutual_knn_graph() 用 to_undirected + mutual filter
+P0-②  state_dict 浅拷贝  → save_best_state() 使用 deepcopy
+P0-③  有向图未对称       → build_mutual_knn_graph() + to_undirected
 P1-⑥  原始 counts 未预处理 → log_normalize()
-P1-⑦  类别不均衡      → build_combined_dataset() 返回 class_weights
-P1-⑧  验证集未分层    → StratifiedShuffleSplit
-P3-⑬  mutual kNN      → 双向确认才保留边
+P1-⑦  类别不均衡         → build_combined_dataset() 返回 class_weights
+P1-⑧  验证集未分层       → StratifiedShuffleSplit
+P3-⑬  mutual kNN         → 双向确认才保留边
+
+新增
+----
+run_experiment : Notebook 调用接口适配（与 Cell 4b 参数名一致）
 """
 
 import copy
@@ -35,13 +38,7 @@ torch.manual_seed(SEED)
 def log_normalize(counts: np.ndarray, scale_factor: float = 1e4) -> np.ndarray:
     """
     Library-size normalization + log1p（等价于 Seurat LogNormalize）。
-
     必须在 StandardScaler 之前做，否则高表达基因主导归一化方向。
-
-    Parameters
-    ----------
-    counts : (n_cells, n_genes) raw UMI counts
-    scale_factor : 目标文库大小（默认 10,000）
     """
     lib_sizes = counts.sum(axis=1, keepdims=True).clip(min=1)
     return np.log1p(counts / lib_sizes * scale_factor)
@@ -53,16 +50,10 @@ def unified_normalize(
 ) -> tuple[np.ndarray, np.ndarray, StandardScaler]:
     """
     统一特征空间归一化。
-
-    关键：只在 scRNA 上 fit_transform，Xenium 用 transform。
-    两个数据集共享同一坐标系，kNN 图才有意义。
-
-    Returns
-    -------
-    scrna_norm, spatial_norm, fitted_scaler
+    只在 scRNA 上 fit_transform，Xenium 用 transform，防止数据泄露。
     """
-    scaler = StandardScaler()
-    scrna_norm = scaler.fit_transform(scrna_expr)
+    scaler       = StandardScaler()
+    scrna_norm   = scaler.fit_transform(scrna_expr)
     spatial_norm = scaler.transform(spatial_expr)
     return scrna_norm, spatial_norm, scaler
 
@@ -76,20 +67,10 @@ def build_mutual_knn_graph(
     k: int = 30,
 ) -> torch.Tensor:
     """
-    构建 mutual kNN 图，并强制对称（无向图）。
+    构建 mutual kNN 图（双向确认 + 强制对称）。
 
-    修复点：
-    - 原始代码只加单向边，GCN/SAGE 需要无向图
-    - Mutual filter：只保留双向确认的近邻（降噪）
-
-    Parameters
-    ----------
-    features : (n_cells, n_features)
-    k        : 每个节点保留的邻居数
-
-    Returns
-    -------
-    edge_index : (2, n_edges) 无向、无重复、无自环
+    修复 P0-③：原始代码只加单向边，GCN/SAGE 需要无向图。
+    Mutual filter：只保留双向确认的近邻（降低噪声边）。
     """
     n = features.shape[0]
     nbrs = NearestNeighbors(
@@ -97,14 +78,12 @@ def build_mutual_knn_graph(
     ).fit(features)
     _, indices = nbrs.kneighbors(features)
 
-    # 建立有向邻居集
     neighbor_sets = [set(indices[i, 1:].tolist()) for i in range(n)]
 
-    # Mutual edges：i∈N(j) AND j∈N(i)
     src, dst = [], []
     for i in range(n):
         for j in neighbor_sets[i]:
-            if i in neighbor_sets[j]:   # mutual 确认
+            if i in neighbor_sets[j]:
                 src.append(i)
                 dst.append(j)
 
@@ -119,8 +98,7 @@ def build_mutual_knn_graph(
                 dst.append(j)
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
-    edge_index = to_undirected(edge_index, num_nodes=n)     # 补全对称边
-    # 去重（to_undirected 已去重，但保险起见）
+    edge_index = to_undirected(edge_index, num_nodes=n)
     edge_index = torch.unique(edge_index, dim=1)
     return edge_index
 
@@ -133,29 +111,21 @@ def build_combined_dataset(
     val_ratio: float = 0.2,
 ) -> tuple[Data, torch.Tensor, dict]:
     """
-    构建半监督联合数据集。
+    构建半监督联合数据集（scRNA 有标签 + Xenium 无标签）。
 
-    修复点：
-    - P1-⑦ 计算 class_weights（不均衡处理）
-    - P1-⑧ 分层采样验证集
-
-    Returns
-    -------
-    data         : PyG Data 对象，含 train/val/xenium 掩码
-    class_weights: (n_classes,) 用于加权损失函数
-    split_info   : {'train_idx': ..., 'val_idx': ...}
+    修复 P1-⑦：class_weights（类别不均衡处理）
+    修复 P1-⑧：StratifiedShuffleSplit 分层采样验证集
+    注意：节点的 spot_mask 属性（与 utils_spot 统一命名）
     """
     n_flex   = len(flex_expr_norm)
     n_xenium = len(xenium_expr_norm)
     n_classes = int(flex_labels.max()) + 1
 
-    # ── 分层采样 ─────────────────────────────────────────
     sss = StratifiedShuffleSplit(
         n_splits=1, test_size=val_ratio, random_state=SEED
     )
     train_idx, val_idx = next(sss.split(flex_expr_norm, flex_labels))
 
-    # ── 类别权重 ──────────────────────────────────────────
     cls_w = compute_class_weight(
         "balanced",
         classes=np.arange(n_classes),
@@ -163,17 +133,14 @@ def build_combined_dataset(
     )
     class_weights = torch.tensor(cls_w, dtype=torch.float)
 
-    # ── 合并特征 + 构图 ───────────────────────────────────
     combined = np.vstack([flex_expr_norm, xenium_expr_norm])
     print(f"  Building mutual kNN graph on {n_flex + n_xenium:,} cells (k={k})…")
     edge_index = build_mutual_knn_graph(combined, k=k)
 
-    # ── 标签（Xenium 用 -1 表示无标签）──────────────────────
     combined_labels = np.concatenate(
         [flex_labels, -np.ones(n_xenium, dtype=int)]
     )
 
-    # ── PyG Data ─────────────────────────────────────────
     data = Data(
         x=torch.tensor(combined, dtype=torch.float),
         edge_index=edge_index,
@@ -181,25 +148,25 @@ def build_combined_dataset(
     )
 
     N = n_flex + n_xenium
-    train_mask  = torch.zeros(N, dtype=torch.bool)
-    val_mask    = torch.zeros(N, dtype=torch.bool)
-    xen_mask    = torch.zeros(N, dtype=torch.bool)
+    train_mask = torch.zeros(N, dtype=torch.bool)
+    val_mask   = torch.zeros(N, dtype=torch.bool)
+    spot_mask  = torch.zeros(N, dtype=torch.bool)
 
     train_mask[train_idx] = True
     val_mask[val_idx]     = True
-    xen_mask[n_flex:]     = True
+    spot_mask[n_flex:]    = True
 
-    data.train_mask  = train_mask
-    data.val_mask    = val_mask
-    data.xenium_mask = xen_mask
-    data.n_flex      = n_flex
-    data.n_xenium    = n_xenium
+    data.train_mask = train_mask
+    data.val_mask   = val_mask
+    data.spot_mask  = spot_mask   # 统一命名（不再使用 xenium_mask）
+    data.n_scrna    = n_flex
+    data.n_spots    = n_xenium
 
     print(
         f"  Edges: {edge_index.shape[1]:,} | "
         f"Train: {train_mask.sum():,} | "
         f"Val: {val_mask.sum():,} | "
-        f"Xenium: {n_xenium:,}"
+        f"Spots: {n_xenium:,}"
     )
     return data, class_weights, {"train_idx": train_idx, "val_idx": val_idx}
 
@@ -209,7 +176,6 @@ def build_combined_dataset(
 # ══════════════════════════════════════════════════════════
 
 def _rbf_kernel(x: torch.Tensor, y: torch.Tensor, bw: float) -> torch.Tensor:
-    """RBF kernel matrix K(x, y) with bandwidth bw."""
     n, m = x.size(0), y.size(0)
     xx = x.pow(2).sum(1, keepdim=True).expand(n, m)
     yy = y.pow(2).sum(1, keepdim=True).t().expand(n, m)
@@ -222,17 +188,7 @@ def mmd_loss(
     target_h: torch.Tensor,
     bandwidths: tuple = (1.0, 10.0, 100.0),
 ) -> torch.Tensor:
-    """
-    Multi-kernel Maximum Mean Discrepancy (MK-MMD)。
-
-    强制对齐 scRNA 和 Xenium 的隐层特征分布，
-    是 domain adaptation 的核心约束。
-
-    Parameters
-    ----------
-    source_h : (n_scrna, h_dim) scRNA 节点的隐层表示
-    target_h : (n_xenium, h_dim) Xenium 节点的隐层表示
-    """
+    """Multi-kernel MMD：对齐 scRNA 和 Xenium 的隐层特征分布。"""
     loss = torch.zeros(1, device=source_h.device)
     for bw in bandwidths:
         Kss = _rbf_kernel(source_h, source_h, bw)
@@ -243,16 +199,7 @@ def mmd_loss(
 
 
 def entropy_regularization(log_probs: torch.Tensor) -> torch.Tensor:
-    """
-    熵最小化正则化（Xenium 无标签节点）。
-
-    鼓励模型对 Xenium 节点作出高置信度预测（低熵），
-    等价于"让决策边界远离无标签数据点"。
-
-    Parameters
-    ----------
-    log_probs : (n_xenium, n_classes) log-softmax 输出
-    """
+    """熵最小化正则化：鼓励 Xenium 节点作出高置信度预测。"""
     probs   = log_probs.exp()
     entropy = -(probs * log_probs).sum(dim=1)
     return entropy.mean()
@@ -262,15 +209,7 @@ def get_pseudo_labels(
     log_probs: torch.Tensor,
     threshold: float = 0.90,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    提取 Xenium 节点的高置信度伪标签。
-
-    Returns
-    -------
-    pseudo_labels   : (n_xenium,) 预测类别（所有节点）
-    high_conf_mask  : (n_xenium,) bool，是否超过 threshold
-    confidence      : (n_xenium,) 最大 softmax 概率
-    """
+    """提取高置信度伪标签。"""
     probs                  = log_probs.exp()
     confidence, pseudo_lbl = probs.max(dim=1)
     high_conf_mask         = confidence >= threshold
@@ -282,19 +221,70 @@ def get_pseudo_labels(
 # ══════════════════════════════════════════════════════════
 
 def save_best_state(model: torch.nn.Module) -> dict:
-    """
-    深拷贝当前模型权重（修复 P0-② 浅拷贝 Bug）。
-
-    .copy() 只复制字典结构，tensor 值仍是引用；
-    GPU 继续训练会原地修改这些 tensor。
-    必须用 copy.deepcopy()。
-    """
+    """深拷贝当前模型权重（修复 P0-② 浅拷贝 Bug）。"""
     return copy.deepcopy(model.state_dict())
 
 
 def set_seed(seed: int = SEED):
-    """全局随机种子"""
+    """全局随机种子。"""
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ══════════════════════════════════════════════════════════
+# 5. Notebook 接口适配：run_experiment
+#    匹配 Cell 4b 的调用签名
+# ══════════════════════════════════════════════════════════
+
+def run_experiment(
+    model: "torch.nn.Module",
+    data,
+    class_weights: "torch.Tensor",
+    n_classes: int,
+    device,
+    params: dict,
+    model_name: str,
+    save_dir: str | None = None,
+) -> dict:
+    """
+    Notebook Cell 4b 调用的训练入口。
+
+    将 Notebook 的调用签名适配到 models.run_experiment 的签名：
+    - n_classes (int)  →  cell_types (list[str])
+    - device 单独参数  →  合并进 params["device"]
+
+    Parameters
+    ----------
+    model         : 已实例化的 GNN 模型（GCN_AMP / GraphSAGE_AMP / GAT_AMP）
+    data          : PyG Data 对象（utils_spot.build_spot_graph 的输出）
+    class_weights : (n_classes,) 类别权重张量
+    n_classes     : 细胞类型数量
+    device        : torch.device 或 str（"cuda:0" / "cpu"）
+    params        : 全局超参字典（Cell 1 的 PARAMS）
+    model_name    : 模型名称（用于保存权重文件名）
+    save_dir      : 权重保存目录（None = 不保存）
+
+    Returns
+    -------
+    result dict（与 models.run_experiment 完全一致）
+    """
+    from models import run_experiment as _train
+
+    # 生成 cell_types 占位列表（训练时只需长度，预测时标签由 Notebook 外层重映射）
+    cell_types = [str(i) for i in range(n_classes)]
+
+    # 合并 device 到 params（models.py 从 params["device"] 读取）
+    _params = dict(params)
+    _params["device"] = str(device) if not isinstance(device, str) else device
+
+    return _train(
+        model=model,
+        model_name=model_name,
+        data=data,
+        cell_types=cell_types,
+        params=_params,
+        class_weights=class_weights,
+        save_dir=save_dir,
+    )

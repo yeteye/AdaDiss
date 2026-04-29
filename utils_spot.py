@@ -1,23 +1,24 @@
 """
 utils_spot.py — 转录本级别数据流水线（不依赖细胞分割）
 
-替代 utils.py 中的 build_combined_dataset，
-将 Xenium 原始转录本 → bin 为 spot → 构建联合图。
+修复清单
+--------
+spot_mask → xenium_mask（与 models.py 统一）
+验证集划分 → StratifiedShuffleSplit（修复 P1-⑧）
 
 设计思路
 --------
 - scRNA 细胞作为有标签节点（ground truth 来自 Flex 注释）
 - Xenium spot 作为无标签节点（目标预测对象）
-- 两类节点共处同一张图，通过特征空间 kNN + 空间 kNN 连边
-- GNN 通过消息传递端到端学习聚合权重（对比 TopACT 的固定半径）
+- 两类节点共处同一张图，通过特征 kNN + 空间 kNN 连边
+- GNN 通过消息传递端到端学习聚合权重
 
 节点特征对齐
 -----------
-- 基因集：Xenium panel ∩ scRNA 基因，两侧使用同一套基因
+- 基因集：Xenium panel ∩ scRNA 基因
 - 归一化：log1p → StandardScaler（只在 scRNA 上 fit，避免数据泄露）
 """
 
-import os
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -25,11 +26,13 @@ import torch
 from torch_geometric.data import Data
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.utils.class_weight import compute_class_weight
 
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # 1. 加载 Xenium 原始转录本
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
 def load_xenium_transcripts(
     transcript_path: str,
@@ -48,7 +51,7 @@ def load_xenium_transcripts(
 
     Returns
     -------
-    DataFrame，列：gene, x, y（已 bin 到 μm 整数格）
+    DataFrame，列：gene, x, y
     """
     if verbose:
         print(f"加载转录本文件: {transcript_path}")
@@ -62,7 +65,7 @@ def load_xenium_transcripts(
         print(f"  原始转录本数: {len(df):,}")
         print(f"  列名: {list(df.columns)}")
 
-    # ── 列名标准化（不同版本 Xenium 输出列名略有差异）────────────
+    # 列名标准化
     col_map = {}
     for c in df.columns:
         lc = c.lower()
@@ -76,29 +79,24 @@ def load_xenium_transcripts(
             col_map[c] = "y_raw"
     df = df.rename(columns=col_map)
 
-    # ── Q-score 过滤 ─────────────────────────────────────────────
     if "qv" in df.columns:
         df = df[df["qv"] >= qv_threshold].copy()
         if verbose:
             print(f"  Q≥{qv_threshold} 过滤后: {len(df):,}")
 
-    # ── 基因过滤（只保留 scRNA 中有的基因）───────────────────────
     gene_set = set(gene_list)
     df = df[df["gene"].isin(gene_set)].copy()
     if verbose:
-        n_shared = df["gene"].nunique()
-        print(f"  基因对齐后: {len(df):,} 条转录本，{n_shared} 个基因")
+        print(f"  基因对齐后: {len(df):,} 条转录本，{df['gene'].nunique()} 个基因")
 
-    # ── 坐标取整（bin 到 1μm 分辨率）────────────────────────────
     df["x"] = df["x_raw"].round(0).astype(int)
     df["y"] = df["y_raw"].round(0).astype(int)
-
     return df[["gene", "x", "y"]].copy()
 
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # 2. 聚合转录本 → spot 表达矩阵
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
 def bin_transcripts_to_spots(
     df: pd.DataFrame,
@@ -108,36 +106,26 @@ def bin_transcripts_to_spots(
     verbose: bool = True,
 ) -> tuple:
     """
-    将转录本聚合为 spot 级别的表达矩阵。
+    将转录本聚合为 spot 级别表达矩阵。
 
     Parameters
     ----------
-    df              : load_xenium_transcripts 的输出
-    gene_list       : 基因列表（决定特征维度和顺序）
-    bin_size        : bin 边长（μm）。推荐 5μm：
-                        1μm → 百万级节点（TopACT 用，GNN 太大）
-                        5μm → 数十万节点（GNN 可接受）
-                       10μm → 接近细胞尺度（节点数少但分辨率损失大）
-    min_transcripts : spot 最小转录本数（过滤噪声 spot）
+    bin_size : bin 边长（μm）。推荐 5μm（节点数适中）
 
     Returns
     -------
-    spot_expr   : (n_spots, n_genes) float32，原始 counts
-    spot_coords : (n_spots, 2) float32，spot 质心坐标（μm）
+    spot_expr   : (n_spots, n_genes) float32 raw counts
+    spot_coords : (n_spots, 2) float32 质心坐标（μm）
     """
     df = df.copy()
-
-    # ── 计算 bin 中心坐标 ─────────────────────────────────────────
     df["bx"] = (df["x"] // bin_size) * bin_size + bin_size // 2
     df["by"] = (df["y"] // bin_size) * bin_size + bin_size // 2
 
-    # ── 基因索引 ─────────────────────────────────────────────────
     gene2idx = {g: i for i, g in enumerate(gene_list)}
     df["gene_idx"] = df["gene"].map(gene2idx)
     df = df.dropna(subset=["gene_idx"])
     df["gene_idx"] = df["gene_idx"].astype(int)
 
-    # ── 为每个 (bx, by) 分配唯一 spot_id ─────────────────────────
     spot_key = df[["bx", "by"]].drop_duplicates().reset_index(drop=True)
     spot_key["spot_id"] = spot_key.index
     df = df.merge(spot_key, on=["bx", "by"])
@@ -145,7 +133,6 @@ def bin_transcripts_to_spots(
     n_spots = len(spot_key)
     n_genes = len(gene_list)
 
-    # ── 稀疏 counts 矩阵 ─────────────────────────────────────────
     rows = df["spot_id"].values
     cols = df["gene_idx"].values
     spot_matrix = sp.coo_matrix(
@@ -153,7 +140,6 @@ def bin_transcripts_to_spots(
         shape=(n_spots, n_genes),
     ).tocsr()
 
-    # ── 过滤低质量 spot ───────────────────────────────────────────
     total = np.array(spot_matrix.sum(axis=1)).ravel()
     keep  = total >= min_transcripts
     spot_matrix = spot_matrix[keep]
@@ -170,12 +156,12 @@ def bin_transcripts_to_spots(
     return spot_expr, spot_coords
 
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # 3. 归一化
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
 def log_normalize(X: np.ndarray) -> np.ndarray:
-    """log1p + 总量归一化"""
+    """log1p + library-size normalization"""
     total = X.sum(axis=1, keepdims=True).clip(min=1)
     return np.log1p(X / total * 1e4).astype(np.float32)
 
@@ -186,7 +172,7 @@ def unified_normalize_spot(
 ) -> tuple:
     """
     统一归一化：
-    1. 各自 log1p
+    1. 各自 log1p 归一化
     2. StandardScaler 只在 scRNA 上 fit，然后 transform 两侧
     """
     scrna_log = log_normalize(scrna_expr)
@@ -199,9 +185,9 @@ def unified_normalize_spot(
     return scrna_norm, spot_norm, scaler
 
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # 4. 构建联合图（核心）
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
 def build_spot_graph(
     scrna_norm:   np.ndarray,
@@ -216,17 +202,20 @@ def build_spot_graph(
     """
     构建 scRNA 细胞 + Xenium spot 的联合异质图。
 
+    修复
+    ----
+    - 节点掩码统一命名为 xenium_mask（与 models.py 一致）
+    - 验证集改用 StratifiedShuffleSplit（修复 P1-⑧）
+
     边的设计
     --------
-    - 特征 kNN（全局）：在归一化基因表达空间连 k_feat 近邻
-      覆盖 scRNA↔spot（跨模态）、scRNA↔scRNA、spot↔spot
-    - 空间 kNN（Xenium 内部）：在物理坐标空间连 k_spatial 近邻
-      让 GNN 能利用空间邻近性聚合局部转录本信息
+    - 特征 kNN（k_feat）：归一化基因表达空间，覆盖跨模态连边
+    - 空间 kNN（k_spatial）：spot 物理坐标，利用空间邻近性
 
     创新点 vs TopACT
     ----------------
-    TopACT  : 固定半径聚合，SVM 分类，各尺度独立，无学习
-    本方法  : 消息传递端到端学习聚合权重，半监督跨模态对齐
+    TopACT  : 固定半径聚合 + SVM，无学习
+    本方法  : GNN 端到端学习聚合权重，半监督跨模态对齐
     """
     n_scrna = scrna_norm.shape[0]
     n_spots = spot_norm.shape[0]
@@ -236,10 +225,9 @@ def build_spot_graph(
         print(f"  scRNA 节点: {n_scrna:,}  |  spot 节点: {n_spots:,}")
         print(f"  总节点数  : {n_total:,}")
 
-    # ── 拼接特征矩阵 ──────────────────────────────────────────────
     X_all = np.vstack([scrna_norm, spot_norm])
 
-    # ── 特征空间 kNN ─────────────────────────────────────────────
+    # ── 特征空间 kNN ─────────────────────────────────────
     if verbose:
         print(f"  构建特征 kNN (k={k_feat})...")
     nn_feat = NearestNeighbors(
@@ -247,11 +235,10 @@ def build_spot_graph(
     )
     nn_feat.fit(X_all)
     _, feat_idx = nn_feat.kneighbors(X_all)
-
     src_f = np.repeat(np.arange(n_total), k_feat)
     dst_f = feat_idx[:, 1:].ravel()
 
-    # ── 空间 kNN（仅 spot 之间）──────────────────────────────────
+    # ── 空间 kNN（仅 spot 之间）──────────────────────────
     if verbose:
         print(f"  构建空间 kNN (k={k_spatial})...")
     nn_sp = NearestNeighbors(
@@ -259,11 +246,10 @@ def build_spot_graph(
     )
     nn_sp.fit(spot_coords)
     _, sp_idx = nn_sp.kneighbors(spot_coords)
-
     src_s = np.repeat(np.arange(n_spots), k_spatial) + n_scrna
     dst_s = sp_idx[:, 1:].ravel() + n_scrna
 
-    # ── 合并 + 双向 + 去重 + 去自环 ──────────────────────────────
+    # ── 合并 + 双向 + 去重 + 去自环 ──────────────────────
     src_all = np.concatenate([src_f, dst_f, src_s, dst_s])
     dst_all = np.concatenate([dst_f, src_f, dst_s, src_s])
     edges   = np.stack([src_all, dst_all], axis=1)
@@ -274,39 +260,41 @@ def build_spot_graph(
     if verbose:
         print(f"  总边数: {edge_index.shape[1]:,}")
 
-    # ── 标签向量（-1 = 无标签）────────────────────────────────────
+    # ── 标签向量（-1 = 无标签）────────────────────────────
     labels_all = np.full(n_total, -1, dtype=np.int64)
     labels_all[:n_scrna] = scrna_labels
 
-    # ── 训练/验证集划分（仅在 scRNA 内）──────────────────────────
-    scrna_idx = np.arange(n_scrna)
-    n_val     = int(n_scrna * val_ratio)
-    rng       = np.random.default_rng(42)
-    val_idx   = rng.choice(scrna_idx, size=n_val, replace=False)
-    train_idx = np.setdiff1d(scrna_idx, val_idx)
+    # ── 分层划分验证集（修复 P1-⑧）──────────────────────
+    sss = StratifiedShuffleSplit(
+        n_splits=1, test_size=val_ratio, random_state=42
+    )
+    scrna_range = np.arange(n_scrna)
+    train_local, val_local = next(sss.split(scrna_range, scrna_labels))
+    train_idx = scrna_range[train_local]   # 全局索引（scRNA 节点在 0..n_scrna-1）
+    val_idx   = scrna_range[val_local]
 
-    train_mask = torch.zeros(n_total, dtype=torch.bool)
-    val_mask   = torch.zeros(n_total, dtype=torch.bool)
-    spot_mask  = torch.zeros(n_total, dtype=torch.bool)
+    train_mask   = torch.zeros(n_total, dtype=torch.bool)
+    val_mask     = torch.zeros(n_total, dtype=torch.bool)
+    xenium_mask  = torch.zeros(n_total, dtype=torch.bool)   # 修复：统一命名
     train_mask[train_idx] = True
     val_mask[val_idx]     = True
-    spot_mask[n_scrna:]   = True
+    xenium_mask[n_scrna:] = True
 
-    # ── 类别权重 ─────────────────────────────────────────────────
-    from sklearn.utils.class_weight import compute_class_weight
+    # ── 类别权重 ──────────────────────────────────────────
     classes = np.unique(scrna_labels)
     cw = compute_class_weight("balanced", classes=classes, y=scrna_labels)
     class_weights = torch.from_numpy(cw).float()
 
-    # ── 组装 PyG Data ─────────────────────────────────────────────
+    # ── 组装 PyG Data ─────────────────────────────────────
     data = Data(
-        x          = torch.from_numpy(X_all).float(),
-        edge_index = edge_index,
-        y          = torch.from_numpy(labels_all).long(),
-        train_mask = train_mask,
-        val_mask   = val_mask,
-        spot_mask  = spot_mask,
+        x           = torch.from_numpy(X_all).float(),
+        edge_index  = edge_index,
+        y           = torch.from_numpy(labels_all).long(),
+        train_mask  = train_mask,
+        val_mask    = val_mask,
+        spot_mask   = xenium_mask,   # 保留 spot_mask 别名（向下兼容）
     )
+    data.xenium_mask = xenium_mask   # 修复：添加 xenium_mask 属性
     data.n_scrna = n_scrna
     data.n_spots = n_spots
 
@@ -319,14 +307,14 @@ def build_spot_graph(
 
     if verbose:
         print(f"  训练: {train_mask.sum()}  验证: {val_mask.sum()}"
-              f"  推断 spot: {spot_mask.sum():,}")
+              f"  推断 spot: {xenium_mask.sum():,}")
 
     return data, class_weights, split_info
 
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # 5. spot 预测 → 细胞级别聚合（评估用）
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
 def aggregate_spot_to_cell(
     spot_proba:  np.ndarray,
@@ -336,10 +324,8 @@ def aggregate_spot_to_cell(
     radius_um:   float = 10.0,
 ) -> tuple:
     """
-    将 spot 预测概率聚合到细胞质心级别。
-
-    对每个细胞，取其 radius_um 范围内所有 spot 的概率均值，
-    再 argmax 得到细胞类型。仅用于最终评估，不影响训练。
+    将 spot 预测概率聚合到细胞质心级别（仅用于最终评估）。
+    对每个细胞，取 radius_um 范围内所有 spot 的概率均值。
     """
     from sklearn.neighbors import BallTree
 
@@ -351,7 +337,6 @@ def aggregate_spot_to_cell(
         if len(nbr) > 0:
             cell_proba[i] = spot_proba[nbr].mean(axis=0)
         else:
-            # 无邻近 spot：取最近1个
             _, nearest = tree.query(cell_coords[[i]], k=1)
             cell_proba[i] = spot_proba[nearest[0, 0]]
 
