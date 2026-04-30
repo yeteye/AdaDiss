@@ -36,25 +36,42 @@ ENV_NAME="LabelTransfer"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BPCELLS_DIR="$HOME/BPCells"
 
+# ─── 数据集配置（修改为 V1 Addon FFPE，版本 2.0.0）────────────────────────────
+XENIUM_ZIP="Xenium_V1_Human_Ovarian_Cancer_Addon_FFPE_outs.zip"
+XENIUM_DIR="Xenium_V1_Human_Ovarian_Cancer_Addon_FFPE_outs"
+XENIUM_URL="https://cf.10xgenomics.com/samples/xenium/2.0.0/Xenium_V1_Human_Ovarian_Cancer_Addon_FFPE/${XENIUM_ZIP}"
+
+FLEX_H5="17k_Ovarian_Cancer_scFFPE_count_filtered_feature_bc_matrix.h5"
+FLEX_H5_URL="https://cf.10xgenomics.com/samples/cell-exp/8.0.1/17k_Ovarian_Cancer_scFFPE/${FLEX_H5}"
+
+ANNOT_CSV="FLEX_Ovarian_Barcode_Cluster_Annotation.csv"
+ANNOT_URL="https://cf.10xgenomics.com/supp/cell-exp/${ANNOT_CSV}"
+
 echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BLUE}   LabelTransfer 项目环境配置脚本${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "  📁 项目根目录: ${PROJECT_ROOT}"
 echo -e "  🐍 conda 环境: ${ENV_NAME}"
+echo -e "  📦 Xenium 数据集: ${XENIUM_DIR}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 
 # ─── 步骤 0：前置检查 ─────────────────────────────────────────────────────────
 info "检查前置依赖..."
-command -v conda &>/dev/null || error "未找到 conda，请先安装 Anaconda / Miniconda"
-command -v git   &>/dev/null || error "未找到 git，请先安装 git"
-success "前置依赖检查通过"
+command -v conda  &>/dev/null || error "未找到 conda，请先安装 Anaconda / Miniconda"
+command -v git    &>/dev/null || error "未找到 git，请先安装 git"
+command -v aria2c &>/dev/null || error "未找到 aria2c，请先安装：
+  Manjaro/Arch : sudo pacman -S aria2
+  Ubuntu/Debian: sudo apt install aria2
+  macOS        : brew install aria2"
+success "前置依赖检查通过（conda / git / aria2c）"
 
 # ─── 步骤 1：创建 conda 环境 ──────────────────────────────────────────────────
 if [ "$SKIP_ENV" = false ]; then
     echo -e "\n${BLUE}[步骤 1/4]${NC} 创建 conda 环境..."
 
     if conda env list | grep -q "^${ENV_NAME} "; then
-        warn "环境 '${ENV_NAME}' 已存在，跳过创建（如需重建请先运行: conda env remove -n ${ENV_NAME}）"
+        warn "环境 '${ENV_NAME}' 已存在，跳过创建"
+        warn "如需重建请先运行: conda env remove -n ${ENV_NAME}"
     else
         info "创建 conda 环境（耗时约 5-15 分钟）..."
         conda create -y -n "${ENV_NAME}" -c conda-forge \
@@ -80,7 +97,6 @@ if [ "$SKIP_ENV" = false ]; then
         success "conda 环境创建完成"
     fi
 
-    # 获取 conda 环境中 R 的路径
     CONDA_R=$(conda run -n "${ENV_NAME}" which R)
     info "R 路径: ${CONDA_R}"
 
@@ -121,7 +137,7 @@ else
     warn "--skip-env 已启用，跳过环境安装步骤"
 fi
 
-# ─── 步骤 5：创建目录结构 ─────────────────────────────────────────────────────
+# ─── 步骤 3：创建目录结构 ─────────────────────────────────────────────────────
 echo -e "\n${BLUE}[步骤 3/4]${NC} 创建项目目录结构..."
 cd "${PROJECT_ROOT}"
 
@@ -129,9 +145,9 @@ DIRS=(
     "data/raw/flex"
     "data/raw/xenium"
     "data/cache"
-    "data/backup"
-    "data/bpcells/flex_counts"
-    "data/bpcells/xenium_counts"
+    "data/back"
+    "data/bpcells/ovarian_flex_counts"
+    "data/bpcells/ovarian_xenium_counts"
     "results/predictions"
     "results/exports"
     "results/seurat"
@@ -150,58 +166,102 @@ for dir in "${DIRS[@]}"; do
 done
 success "目录结构已就绪"
 
-# ─── 步骤 6：下载数据 ─────────────────────────────────────────────────────────
+# ─── 步骤 4：下载数据 ─────────────────────────────────────────────────────────
 if [ "$SKIP_DATA" = false ]; then
-    echo -e "\n${BLUE}[步骤 4/4]${NC} 下载原始数据..."
+    echo -e "\n${BLUE}[步骤 4/4]${NC} 下载原始数据（使用 aria2c 多线程加速）..."
+
+    # aria2c 公共参数
+    ARIA2_OPTS="-x 16 -s 16 -k 1M -c --console-log-level=notice"
+
     cd "${PROJECT_ROOT}/data/raw"
 
-    # ── Xenium 数据（约 7GB）─────────────────────────────────────────────────
-    XENIUM_ZIP="Xenium_Prime_Ovarian_Cancer_FFPE_XRrun_outs.zip"
-    XENIUM_URL="https://s3-us-west-2.amazonaws.com/10x.files/samples/xenium/3.0.0/Xenium_Prime_Ovarian_Cancer_FFPE_XRrun/${XENIUM_ZIP}"
-
-    if [ -d "xenium/Xenium_Prime_Ovarian_Cancer_FFPE_XRrun_outs" ]; then
-        warn "Xenium 数据已存在，跳过下载"
+    # ── Xenium 数据（V1 Addon FFPE，约 14 GB）────────────────────────────────
+    echo -e "\n  ${CYAN}[Xenium]${NC} Xenium V1 Human Ovarian Cancer Addon FFPE (v2.0.0)"
+    if [ -d "xenium/${XENIUM_DIR}" ]; then
+        warn "Xenium 数据目录已存在，跳过下载"
+        warn "路径: xenium/${XENIUM_DIR}"
     else
-        info "下载 Xenium 数据（约 7GB，耗时较长）..."
-        wget -c --progress=bar:force -P xenium/ "${XENIUM_URL}" 2>&1 | tail -1
-        info "解压 Xenium 数据..."
-        unzip -q "xenium/${XENIUM_ZIP}" -d xenium/
+        info "下载 Xenium 数据（约 14 GB，16 线程）..."
+        aria2c ${ARIA2_OPTS} \
+            --dir="xenium" \
+            --out="${XENIUM_ZIP}" \
+            "${XENIUM_URL}"
+
+        info "选择性解压（只提取必要文件，节省磁盘和时间）..."
+        unzip -j "xenium/${XENIUM_ZIP}" \
+            "*/transcripts.parquet" \
+            "*/cells.csv.gz" \
+            "*/cells.parquet" \
+            "*/cell_feature_matrix.h5" \
+            "*/gene_panel.json" \
+            -d "xenium/${XENIUM_DIR}/"
+
+        info "删除 ZIP 文件（已解压）..."
         rm -f "xenium/${XENIUM_ZIP}"
-        success "Xenium 数据下载完成"
+
+        success "Xenium 数据下载并解压完成"
+        info "解压内容:"
+        ls -lh "xenium/${XENIUM_DIR}/"
     fi
 
-    # ── Flex scRNA-seq h5 文件（约 1.3GB）────────────────────────────────────
-    FLEX_H5="17k_Ovarian_Cancer_scFFPE_count_filtered_feature_bc_matrix.h5"
-    FLEX_URL="https://cf.10xgenomics.com/samples/cell-exp/8.0.1/17k_Ovarian_Cancer_scFFPE/${FLEX_H5}"
-
+    # ── Flex scRNA-seq h5（约 1.3 GB）────────────────────────────────────────
+    echo -e "\n  ${CYAN}[Flex]${NC} scRNA-seq 计数矩阵 (.h5)"
     if [ -f "flex/${FLEX_H5}" ]; then
         warn "Flex h5 文件已存在，跳过下载"
     else
-        info "下载 Flex scRNA-seq h5 文件（约 1.3GB）..."
-        curl -C - -L --progress-bar -o "flex/${FLEX_H5}" "${FLEX_URL}"
+        info "下载 Flex scRNA-seq h5（约 1.3 GB，16 线程）..."
+        aria2c ${ARIA2_OPTS} \
+            --dir="flex" \
+            --out="${FLEX_H5}" \
+            "${FLEX_H5_URL}"
         success "Flex h5 文件下载完成"
     fi
 
-    # ── 细胞注释 CSV ──────────────────────────────────────────────────────────
-    ANNOT_CSV="FLEX_Ovarian_Barcode_Cluster_Annotation.csv"
-    ANNOT_URL="https://cf.10xgenomics.com/supp/cell-exp/${ANNOT_CSV}"
-
+    # ── 细胞类型预注释 CSV（约 1 MB）─────────────────────────────────────────
+    echo -e "\n  ${CYAN}[Flex]${NC} 细胞类型预注释文件 (.csv)"
     if [ -f "flex/${ANNOT_CSV}" ]; then
         warn "注释文件已存在，跳过下载"
     else
-        info "下载细胞类型注释文件..."
-        curl -C - -L --progress-bar -o "flex/${ANNOT_CSV}" "${ANNOT_URL}"
+        info "下载细胞类型注释文件（约 1 MB）..."
+        aria2c -x 4 -s 4 -c \
+            --dir="flex" \
+            --out="${ANNOT_CSV}" \
+            "${ANNOT_URL}"
         success "注释文件下载完成"
     fi
 
     cd "${PROJECT_ROOT}"
+
+    # ── 最终校验 ─────────────────────────────────────────────────────────────
+    echo -e "\n${CYAN}[校验]${NC} 检查必要文件是否存在..."
+    REQUIRED_FILES=(
+        "data/raw/xenium/${XENIUM_DIR}/transcripts.parquet"
+        "data/raw/xenium/${XENIUM_DIR}/cells.csv.gz"
+        "data/raw/xenium/${XENIUM_DIR}/cell_feature_matrix.h5"
+        "data/raw/flex/${FLEX_H5}"
+        "data/raw/flex/${ANNOT_CSV}"
+    )
+    ALL_OK=true
+    for f in "${REQUIRED_FILES[@]}"; do
+        if [ -f "${f}" ]; then
+            SIZE=$(du -sh "${f}" | cut -f1)
+            success "  ✅ ${f}  (${SIZE})"
+        else
+            warn     "  ❌ 缺失: ${f}"
+            ALL_OK=false
+        fi
+    done
+    if [ "$ALL_OK" = false ]; then
+        warn "部分文件缺失，请重新运行脚本或手动下载"
+    fi
+
 else
     warn "--skip-data 已启用，跳过数据下载步骤"
 fi
 
 # ─── 完成 ─────────────────────────────────────────────────────────────────────
 echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}   ✅ 环境配置完成！${NC}"
+echo -e "${GREEN}   ✅ 配置完成！${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "\n  启动 Jupyter Notebook："
 echo -e "  ${CYAN}conda activate ${ENV_NAME} && jupyter notebook${NC}"
