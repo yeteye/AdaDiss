@@ -47,3 +47,12 @@ project/
 
 1. 先运行 `labelTransfer.ipynb`（R 预处理，生成 cache/）
 2. 运行 `train.ipynb`（Cell 1 → Cell 9，Cell 10 可选）
+~~~
+# 1. 设置环境变量解决碎片问题（当前会话生效）
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# 2. 永久写入 conda 环境（重启后也有效）
+conda activate spatial_gnn
+conda env config vars set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+conda activate spatial_gnn   # 重新激活使其生效
+~~~
