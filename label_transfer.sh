@@ -145,7 +145,7 @@ DIRS=(
     "data/raw/flex"
     "data/raw/xenium"
     "data/cache"
-    "data/back"
+    "data/backup"
     "data/bpcells/ovarian_flex_counts"
     "data/bpcells/ovarian_xenium_counts"
     "results/predictions"

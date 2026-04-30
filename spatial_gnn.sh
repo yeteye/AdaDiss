@@ -144,8 +144,7 @@ if [[ "$SKIP_CREATE_ENV" == "false" ]]; then
         rpy2=3.5 \
         r-base=4.3 r-essentials=4.3 \
         r-matrix r-ggplot2 r-dplyr r-tidyr \
-        r-jsonlite r-hdf5r r-remotes r-arrow r-irkernel \
-        bioconductor-biocmanager
+        r-jsonlite r-hdf5r r-remotes r-arrow r-irkernel
     success "conda 环境创建完成"
 fi
 
@@ -407,7 +406,7 @@ ok <- TRUE
 for (pkg in pkgs) {
     if (requireNamespace(pkg, quietly = TRUE)) {
         v <- tryCatch(as.character(packageVersion(pkg)), error = function(e) "?")
-        cat(sprintf("  \033[32m\u2713\033[0m %-18s %s\n", pkg, v))
+        cat(sprintf("  %s %-18s %s\n", "\u2713", pkg, v))
     } else {
         cat(sprintf("  \033[31m\u2717\033[0m %-18s NOT FOUND\n", pkg))
         ok <- FALSE
