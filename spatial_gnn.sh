@@ -210,6 +210,23 @@ else
     success "scanpy 1.10.0"
 fi
 
+# ── pyarrow / fastparquet（读取 .parquet 文件必须，train notebook Cell 2 依赖）
+INSTALLED_PYARROW=$($RUN python -c "import pyarrow; print(pyarrow.__version__)" 2>/dev/null || echo "none")
+if [[ "$INSTALLED_PYARROW" != "none" ]]; then
+    warn "pyarrow ${INSTALLED_PYARROW} 已安装，跳过"
+else
+    info "安装 pyarrow（读取 Xenium transcripts.parquet 必需）..."
+    $RUN pip install "pyarrow>=14.0" --quiet
+    success "pyarrow"
+fi
+
+INSTALLED_FP=$($RUN python -c "import fastparquet; print(fastparquet.__version__)" 2>/dev/null || echo "none")
+if [[ "$INSTALLED_FP" != "none" ]]; then
+    warn "fastparquet ${INSTALLED_FP} 已安装，跳过"
+else
+    $RUN pip install "fastparquet" --quiet && success "fastparquet" || warn "fastparquet 安装失败（pyarrow 已够用）"
+fi
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 5: BPCells — git clone → 本地编译安装（必须，不可跳过）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -374,6 +391,7 @@ CHECKS = [
     ("rpy2",            "import rpy2;                    v=rpy2.__version__"),
     ("anndata",         "import anndata;                 v=anndata.__version__"),
     ("scanpy",          "import scanpy as sc;            v=sc.__version__"),
+    ("pyarrow",         "import pyarrow;                  v=pyarrow.__version__"),
 ]
 
 failed = []
@@ -399,21 +417,24 @@ if [[ "$SKIP_R" == "false" ]]; then
     $RUN Rscript - <<'REOF'
 pkgs <- c("Seurat", "SeuratObject", "SeuratDisk", "BPCells",
           "dplyr", "ggplot2", "jsonlite", "hdf5r", "Matrix",
-          "IRkernel", "rpy2" |> tryCatch(expr=NULL, error=function(e)NULL))
-pkgs <- pkgs[!sapply(pkgs, is.null)]
+          "IRkernel")
 
 ok <- TRUE
 for (pkg in pkgs) {
     if (requireNamespace(pkg, quietly = TRUE)) {
         v <- tryCatch(as.character(packageVersion(pkg)), error = function(e) "?")
-        cat(sprintf("  %s %-18s %s\n", "\u2713", pkg, v))
+        # 修复：不在同一字符串中混用 \uXXXX 和 \n
+        tick <- "\u2713"
+        cat(paste0("  ", tick, " ", formatC(pkg, width=-18), " ", v, "\n"))
     } else {
-        cat(sprintf("  \033[31m\u2717\033[0m %-18s NOT FOUND\n", pkg))
+        cross <- "\u2717"
+        cat(paste0("  \033[31m", cross, "\033[0m ", formatC(pkg, width=-18),
+                   " NOT FOUND\n"))
         ok <- FALSE
     }
 }
 if (!ok) quit(status = 1)
-cat("\n\033[32m  所有 R 包验证通过 ✓\033[0m\n")
+cat("\n  所有 R 包验证通过\n")
 REOF
 fi
 
