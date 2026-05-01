@@ -196,7 +196,7 @@ else
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 4: scanpy（pip，版本对齐 requirements.txt）
+# Step 4: scanpy（conda，版本对齐 requirements.txt）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 step "Step 4: 安装 scanpy（pip）"
 
@@ -206,7 +206,7 @@ INSTALLED_SCANPY=$($RUN python -c "import scanpy; print(scanpy.__version__)" 2>/
 if [[ "$INSTALLED_SCANPY" == "1.10"* ]]; then
     warn "scanpy ${INSTALLED_SCANPY} 已安装，跳过"
 else
-    $RUN pip install "scanpy==1.10.0" --quiet
+    $RUN conda install "scanpy==1.10.0" --quiet
     success "scanpy 1.10.0"
 fi
 
