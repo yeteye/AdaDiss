@@ -509,7 +509,7 @@ def aggregate_spot_to_cell(
     from sklearn.neighbors import BallTree
 
     if radius_um is None:
-        radius_um = bin_size * 2.5
+        radius_um = bin_size * 1.5
 
     tree = BallTree(spot_coords, metric="euclidean")
     indices = tree.query_radius(cell_coords, r=radius_um)
