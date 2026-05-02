@@ -1,28 +1,19 @@
 """
 models.py — GNN 模型定义 + 半监督 Domain Adaptation 训练循环
 
-v3 核心修复（按老师建议）
-==========================
-
-[Fix 4] 残差连接（提升梯度流动，所有三种架构）
-  GCN/GraphSAGE: h2 = h2 + h1  （hidden_dim → hidden_dim，维度匹配，直接相加）
-  GAT:           h2 = h2 + res_proj(h1)  （heads*hidden → hidden，需线性投影）
-
-[Fix 5] Dropout 0.5 → 0.3
-  0.5 对类别不平衡小数据集过于激进，导致信息丢失，降低至 0.3
-
-[Fix 6] BatchNorm 保持现有位置（conv → bn → relu，标准顺序）
-
-修复清单（沿用 v2）
--------------------
+修复清单
+--------
 P0-②  state_dict 浅拷贝  → save_best_state()（deepcopy）
-P0-③  data.xenium_mask   → data.spot_mask
-P1-⑤  MMD + 熵正则 + 伪标签
-P1-⑦  class_weights 传入 nll_loss
-P2-⑨  ReduceLROnPlateau
-P2-⑩  clip_grad_norm_
-P2-⑪  BatchNorm1d
-P3-⑫  get_pseudo_labels
+P0-③  data.xenium_mask   → data.spot_mask（与 utils_spot.py 统一）
+P1-⑤  缺 DA 机制         → MMD + 熵正则 + 伪标签
+P1-⑦  无类别权重         → class_weights 传入 nll_loss
+P2-⑨  无学习率调度器     → ReduceLROnPlateau
+P2-⑩  无梯度裁剪         → clip_grad_norm_
+P2-⑪  无批归一化         → BatchNorm1d
+P3-⑫  无伪标签           → get_pseudo_labels
+P3-⑭  维度跨度大         → proj_dim 投影层
+新增   save_dir 权重保存  → {model_name}_best.pt
+新增   scrna_embeddings   → predict_xenium 同时返回 scRNA 嵌入（供 eval Fig 2）
 """
 
 import os
@@ -49,12 +40,15 @@ from utils import (
 
 class GCN(nn.Module):
     """
-    三层图卷积网络，带 BatchNorm + Dropout + 残差连接。
+    三层图卷积网络，带 BatchNorm + Dropout。
 
-    v3 改动
-    -------
-    - [Fix 4] Layer2 残差：h2 = h2 + h1（均为 hidden_dim，维度天然匹配）
-    - [Fix 5] dropout 默认值 0.5 → 0.3
+    参数
+    ----
+    in_dim     : 输入特征维度
+    hidden_dim : 隐层维度
+    out_dim    : 输出类别数
+    dropout    : Dropout 概率
+    proj_dim   : 可选投影层维度（None=不用），用于缓解高维输入跨度问题
     """
 
     def __init__(
@@ -62,7 +56,7 @@ class GCN(nn.Module):
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        dropout: float = 0.3,          # [Fix 5] 0.5 → 0.3
+        dropout: float = 0.5,
         proj_dim: int | None = None,
     ):
         super().__init__()
@@ -84,26 +78,18 @@ class GCN(nn.Module):
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
         self.bn2   = nn.BatchNorm1d(hidden_dim)
         self.conv3 = GCNConv(hidden_dim, out_dim)
-        # [Fix 4] GCN 不需要额外投影层，因为 conv1/conv2 输出均为 hidden_dim
 
     def encode(self, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
         """返回 (隐层嵌入 h, log-softmax 输出)"""
         x, ei = data.x, data.edge_index
         if self.proj is not None:
             x = self.proj(x)
-
-        # Layer 1
-        h1 = F.relu(self.bn1(self.conv1(x, ei)))
-        h1 = F.dropout(h1, p=self.dropout, training=self.training)
-
-        # Layer 2 + [Fix 4] 残差连接
-        h2 = F.relu(self.bn2(self.conv2(h1, ei)))
-        h2 = h2 + h1                   # 残差：维度均为 hidden_dim，直接相加
-        h2 = F.dropout(h2, p=self.dropout, training=self.training)
-
-        # Output layer
-        out = self.conv3(h2, ei)
-        return h2, F.log_softmax(out, dim=1)
+        x = F.relu(self.bn1(self.conv1(x, ei)))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        h = F.relu(self.bn2(self.conv2(x, ei)))
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        out = self.conv3(h, ei)
+        return h, F.log_softmax(out, dim=1)
 
     def forward(self, data: Data) -> torch.Tensor:
         _, log_probs = self.encode(data)
@@ -111,21 +97,14 @@ class GCN(nn.Module):
 
 
 class GraphSAGE(nn.Module):
-    """
-    GraphSAGE，更适合归纳式推断（inductive）。
-
-    v3 改动
-    -------
-    - [Fix 4] Layer2 残差：h2 = h2 + h1
-    - [Fix 5] dropout 默认值 0.5 → 0.3
-    """
+    """GraphSAGE，更适合归纳式推断（inductive）。结构同 GCN。"""
 
     def __init__(
         self,
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        dropout: float = 0.3,          # [Fix 5]
+        dropout: float = 0.5,
         proj_dim: int | None = None,
     ):
         super().__init__()
@@ -150,19 +129,12 @@ class GraphSAGE(nn.Module):
         x, ei = data.x, data.edge_index
         if self.proj is not None:
             x = self.proj(x)
-
-        # Layer 1
-        h1 = F.relu(self.bn1(self.conv1(x, ei)))
-        h1 = F.dropout(h1, p=self.dropout, training=self.training)
-
-        # Layer 2 + [Fix 4] 残差连接
-        h2 = F.relu(self.bn2(self.conv2(h1, ei)))
-        h2 = h2 + h1                   # 残差
-        h2 = F.dropout(h2, p=self.dropout, training=self.training)
-
-        # Output layer
-        out = self.conv3(h2, ei)
-        return h2, F.log_softmax(out, dim=1)
+        x = F.relu(self.bn1(self.conv1(x, ei)))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        h = F.relu(self.bn2(self.conv2(x, ei)))
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        out = self.conv3(h, ei)
+        return h, F.log_softmax(out, dim=1)
 
     def forward(self, data: Data) -> torch.Tensor:
         _, log_probs = self.encode(data)
@@ -170,16 +142,7 @@ class GraphSAGE(nn.Module):
 
 
 class GAT(nn.Module):
-    """
-    图注意力网络，带残差连接。
-
-    v3 改动
-    -------
-    - [Fix 4] Layer2 残差：GAT 中 conv1 输出 hidden_dim*heads，conv2 输出 hidden_dim
-              维度不匹配 → 增加 res_proj 线性层进行投影
-              h2 = h2 + self.res_proj(h1)
-    - [Fix 5] dropout 默认值 0.5 → 0.3
-    """
+    """图注意力网络，4头注意力。"""
 
     def __init__(
         self,
@@ -187,7 +150,7 @@ class GAT(nn.Module):
         hidden_dim: int,
         out_dim: int,
         heads: int = 4,
-        dropout: float = 0.3,          # [Fix 5]
+        dropout: float = 0.5,
         proj_dim: int | None = None,
     ):
         super().__init__()
@@ -211,27 +174,16 @@ class GAT(nn.Module):
         self.conv3 = GATConv(hidden_dim, out_dim,
                              heads=1, dropout=dropout, concat=False)
 
-        # [Fix 4] GAT 残差投影：hidden_dim * heads → hidden_dim
-        # 因为 conv1 输出是 hidden_dim * heads，conv2 输出是 hidden_dim，维度不匹配
-        self.res_proj = nn.Linear(hidden_dim * heads, hidden_dim, bias=False)
-
     def encode(self, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
         x, ei = data.x, data.edge_index
         if self.proj is not None:
             x = self.proj(x)
-
-        # Layer 1：输出 hidden_dim * heads
-        h1 = F.elu(self.bn1(self.conv1(x, ei)))
-        h1 = F.dropout(h1, p=self.dropout, training=self.training)
-
-        # Layer 2 + [Fix 4] 残差连接（通过线性投影匹配维度）
-        h2 = F.elu(self.bn2(self.conv2(h1, ei)))
-        h2 = h2 + self.res_proj(h1)    # res_proj: hidden_dim*heads → hidden_dim
-        h2 = F.dropout(h2, p=self.dropout, training=self.training)
-
-        # Output layer
-        out = self.conv3(h2, ei)
-        return h2, F.log_softmax(out, dim=1)
+        x = F.elu(self.bn1(self.conv1(x, ei)))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        h = F.elu(self.bn2(self.conv2(x, ei)))
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        out = self.conv3(h, ei)
+        return h, F.log_softmax(out, dim=1)
 
     def forward(self, data: Data) -> torch.Tensor:
         _, log_probs = self.encode(data)
@@ -248,13 +200,17 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     class_weights: torch.Tensor,
     lambda_mmd: float = 0.1,
-    lambda_ent: float = 0.05,          # [超参] 老师建议从 0.01 → 0.05
+    lambda_ent: float = 0.01,
     lambda_pl:  float = 0.3,
     max_grad_norm: float = 1.0,
     cached_pseudo_labels: torch.Tensor | None = None,
     cached_pseudo_mask: torch.Tensor | None = None,
 ) -> dict:
-    """一个完整训练 epoch（含 DA 损失）。"""
+    """
+    一个完整训练 epoch。
+
+    修复：所有 data.xenium_mask → data.spot_mask
+    """
     model.train()
     optimizer.zero_grad()
 
@@ -267,9 +223,9 @@ def train_epoch(
         weight=class_weights.to(data.x.device),
     )
 
-    # 2. MMD 损失（随机子采样）
+    # 2. MMD 损失（随机子采样，避免 O(n²) 显存）
     scrna_idx  = data.train_mask.nonzero(as_tuple=True)[0]
-    spot_idx   = data.spot_mask.nonzero(as_tuple=True)[0]
+    spot_idx   = data.spot_mask.nonzero(as_tuple=True)[0]   # 修复：spot_mask
 
     n_sample = min(512, len(scrna_idx), len(spot_idx))
     s_sample = scrna_idx[torch.randperm(len(scrna_idx))[:n_sample]]
@@ -278,12 +234,12 @@ def train_epoch(
     loss_mmd = mmd_loss(h[s_sample], h[t_sample])
 
     # 3. 熵正则化（Xenium spot 节点）
-    loss_ent = entropy_regularization(log_probs[data.spot_mask])
+    loss_ent = entropy_regularization(log_probs[data.spot_mask])  # 修复
 
     # 4. 伪标签损失
     loss_pl = torch.tensor(0.0, device=data.x.device)
     if cached_pseudo_labels is not None and cached_pseudo_mask is not None:
-        spot_global_idx = data.spot_mask.nonzero(as_tuple=True)[0]
+        spot_global_idx = data.spot_mask.nonzero(as_tuple=True)[0]  # 修复
         high_conf_idx   = spot_global_idx[cached_pseudo_mask]
         if high_conf_idx.numel() > 0:
             loss_pl = F.nll_loss(
@@ -357,25 +313,33 @@ def predict_xenium(
     data: Data,
     cell_types: list[str],
 ) -> dict:
-    """推断所有 spot 节点的细胞类型。"""
+    """
+    推断所有 spot 节点的细胞类型。
+
+    修复：
+    - xenium_mask → spot_mask
+    - 同时返回 scrna_embeddings（供 eval.py Fig 2 UMAP 使用）
+    """
     model.eval()
     h, log_probs = model.encode(data)
 
-    spot_probs  = log_probs[data.spot_mask].exp().cpu().numpy()
+    # Spot 节点预测
+    spot_probs  = log_probs[data.spot_mask].exp().cpu().numpy()   # 修复
     spot_idx    = spot_probs.argmax(axis=1)
     spot_labels = [cell_types[i] for i in spot_idx]
-    spot_h      = h[data.spot_mask].cpu().numpy()
+    spot_h      = h[data.spot_mask].cpu().numpy()                  # 修复
 
+    # scRNA 节点嵌入（用于 Fig 2 域对齐 UMAP）
     n_scrna    = getattr(data, "n_scrna", data.train_mask.shape[0])
     scrna_h    = h[:n_scrna].cpu().numpy()
 
     return {
-        "labels":           spot_labels,
-        "indices":          spot_idx,
-        "probs":            spot_probs,
-        "embeddings":       spot_h,
+        "labels":          spot_labels,
+        "indices":         spot_idx,
+        "probs":           spot_probs,
+        "embeddings":      spot_h,
         "scrna_embeddings": scrna_h,
-        "confidence":       spot_probs.max(axis=1),
+        "confidence":      spot_probs.max(axis=1),
     }
 
 
@@ -393,13 +357,13 @@ def run_experiment(
     save_dir: str | None = None,
 ) -> dict:
     """
-    完整训练一个 GNN 模型。
+    完整训练一个 GNN 模型（接收已实例化的 model）。
 
-    v3 超参调整（老师建议）
-    ----------------------
-    patience      : 40 → 60（伪标签从 epoch 30+ 开始，原来太早停）
-    pl_threshold  : 0.90 → 0.75（从 params 读取，在 notebook Cell 1 修改）
-    lambda_ent    : 0.01 → 0.05（从 params 读取，在 notebook Cell 1 修改）
+    修复：
+    - 接收 model 实例而非 model_class（与 notebook 调用一致）
+    - 新增 save_dir：保存 {model_name}_best.pt
+    - 返回 best_val_acc、best_epoch
+    - 修复所有 xenium_mask → spot_mask
     """
     device = params.get("device", "cpu")
     from gpu_utils import get_mem_info, vram_str
@@ -431,8 +395,6 @@ def run_experiment(
     best_state    = None
     patience_cnt  = 0
     warmup_epochs = params.get("warmup_epochs", 30)
-    # [超参] patience 从 40 → 60（老师建议，在 PARAMS 中修改）
-    patience      = params.get("patience", 60)
     history       = []
 
     pseudo_labels_cache = None
@@ -454,16 +416,14 @@ def run_experiment(
             model.eval()
             with torch.no_grad():
                 _, lp = model.encode(data)
-            # [超参] pl_threshold 从 0.90 → 0.75（在 PARAMS 中修改）
             pl, pm, _ = get_pseudo_labels(
-                lp[data.spot_mask],
-                threshold=params.get("pl_threshold", 0.75),
+                lp[data.spot_mask], threshold=params.get("pl_threshold", 0.90)  # 修复
             )
             pseudo_labels_cache = pl.detach()
             pseudo_mask_cache   = pm.detach()
             n_pl = pm.sum().item()
             if n_pl > 0:
-                total_spot = data.spot_mask.sum().item()
+                total_spot = data.spot_mask.sum().item()  # 修复
                 tqdm.write(f"  [Ep {epoch:3d}] 伪标签更新：{n_pl:,} 个 "
                            f"({100*n_pl/total_spot:.1f}%)")
 
@@ -471,7 +431,7 @@ def run_experiment(
         losses = train_epoch(
             model, data, optimizer, class_weights,
             lambda_mmd=params.get("lambda_mmd", 0.1),
-            lambda_ent=params.get("lambda_ent", 0.05) if use_pl else 0.0,
+            lambda_ent=params.get("lambda_ent", 0.01) if use_pl else 0.0,
             lambda_pl=params.get("lambda_pl",  0.3)   if use_pl else 0.0,
             max_grad_norm=params.get("max_grad_norm", 1.0),
             cached_pseudo_labels=pseudo_labels_cache if use_pl else None,
@@ -494,7 +454,7 @@ def run_experiment(
             best_val_f1  = metrics["val_f1_macro"]
             best_val_acc = metrics["val_acc"]
             best_epoch   = epoch
-            best_state   = save_best_state(model)
+            best_state   = save_best_state(model)   # deepcopy，修复 P0-②
             patience_cnt = 0
         else:
             patience_cnt += 1
@@ -505,10 +465,10 @@ def run_experiment(
             "F1":   f"{metrics['val_f1_macro']:.3f}",
             "VRAM": vram_str(device),
             "lr":   f"{log['lr']:.1e}",
-            "pat":  f"{patience_cnt}/{patience}",
+            "pat":  f"{patience_cnt}/{params['patience']}",
         }, refresh=True)
 
-        if patience_cnt >= patience:
+        if patience_cnt >= params["patience"]:
             tqdm.write(f"  Early stop @ ep {epoch}  best F1={best_val_f1:.4f}")
             break
 
