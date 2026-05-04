@@ -260,18 +260,24 @@ def prepare_features_for_gnn(
 def compute_capped_class_weights(
     labels,
     max_weight_multiplier: float = 5.0,
-    verbose: bool = True,
+    min_weight:            float = 1.0,
+    verbose:               bool  = True,
 ):
-    """compute_class_weight('balanced') 后归一化并 clip 到 [0, max_weight_multiplier]。"""
+    """
+    修改：增加 min_weight 下限。原 normed/mean 后多数类权重 < 1，
+          导致模型对多数类错分惩罚不足，引发亚型反向偏置。
+          min_weight=1.0 保证多数类至少与平均类等权。
+    """
     classes = np.unique(labels)
     n_classes = int(labels.max()) + 1
     raw = compute_class_weight("balanced", classes=classes, y=labels)
     normed = raw / raw.mean()
-    capped = np.clip(normed, 0.0, max_weight_multiplier)
+    capped = np.clip(normed, min_weight, max_weight_multiplier)
 
     if verbose:
         print(f"    [权重] {len(classes)} 类 | raw [{raw.min():.2f}, {raw.max():.2f}] | "
-              f"capped [{capped.min():.2f}, {capped.max():.2f}] (上限={max_weight_multiplier}×)")
+              f"capped [{capped.min():.2f}, {capped.max():.2f}] "
+              f"(范围 [{min_weight}, {max_weight_multiplier}]×)")
 
     weight_vec = np.ones(n_classes, dtype=np.float32)
     for c, w in zip(classes, capped):
@@ -334,6 +340,76 @@ def _mutual_cross_knn(X_a, X_b, k=10, verbose=True):
               f"{time.time()-t0:.1f}s (mutual rate {sym:.1%})")
     return np.array(src, dtype=np.int64), np.array(dst, dtype=np.int64)
 
+# ══════════════════════════════════════════════════════════════════
+# 5b. 修复版跨域边构造（mutual + 双向 asymmetric）
+# ══════════════════════════════════════════════════════════════════
+
+def _cross_domain_edges(
+    X_a, X_b,
+    k_mutual: int = 10,
+    k_asym:   int = 10,
+    verbose:  bool = True,
+):
+    """
+    [新增] 跨域边构造，修复纯 mutual NN 在域规模不对称时的稀疏问题。
+
+    输出三类边的并集（去重在 build_spot_graph 末尾统一做）：
+      1. mutual NN（高质量但稀疏）
+      2. cell  → spot top-k_asym（保证每个 cell 至少 k_asym 条跨域边）
+      3. spot → cell top-k_asym（保证每个 spot 至少 k_asym 条跨域边）
+
+    覆盖率分析（k_asym=10, n_a=16569, n_b=298053）：
+      asym 边数 = n_a*k_asym + n_b*k_asym = 165K + 2.98M = ~3.15M
+      占总边比 ≈ 3.15M / (16M base + 3.15M cross) ≈ 16%   ✅ 健康区间
+    """
+    t0 = time.time()
+    n_a, n_b = len(X_a), len(X_b)
+    k_max = min(max(k_mutual, k_asym), n_a, n_b)
+
+    # 一次性查询 max(k_mutual, k_asym) 个邻居，复用结果
+    nbrs_b = NearestNeighbors(n_neighbors=k_max, algorithm="kd_tree",
+                              n_jobs=-1).fit(X_b)
+    _, idx_a2b = nbrs_b.kneighbors(X_a)        # cell  → spot
+
+    nbrs_a = NearestNeighbors(n_neighbors=k_max, algorithm="kd_tree",
+                              n_jobs=-1).fit(X_a)
+    _, idx_b2a = nbrs_a.kneighbors(X_b)        # spot → cell
+
+    src_list, dst_list = [], []
+
+    # 1. mutual NN（用 k_mutual）─────────────────────────────
+    a2b_m = idx_a2b[:, :k_mutual]
+    b2a_m = idx_b2a[:, :k_mutual]
+    b_set_of_a = [set(r.tolist()) for r in a2b_m]
+    a_set_of_b = [set(r.tolist()) for r in b2a_m]
+    n_mut = 0
+    for i in range(n_a):
+        for j in b_set_of_a[i]:
+            if i in a_set_of_b[j]:
+                src_list.append(i); dst_list.append(j); n_mut += 1
+
+    # 2. cell → spot 单向 top-k_asym ────────────────────────
+    a2b_a = idx_a2b[:, :k_asym]
+    src_list.extend(np.repeat(np.arange(n_a), k_asym).tolist())
+    dst_list.extend(a2b_a.ravel().tolist())
+
+    # 3. spot → cell 单向 top-k_asym ────────────────────────
+    b2a_a = idx_b2a[:, :k_asym]
+    src_list.extend(b2a_a.ravel().tolist())
+    dst_list.extend(np.repeat(np.arange(n_b), k_asym).tolist())
+
+    src = np.array(src_list, dtype=np.int64)
+    dst = np.array(dst_list, dtype=np.int64)
+
+    if verbose:
+        n_asym = len(src) - n_mut
+        mut_rate = n_mut / max(n_a * k_mutual, 1)
+        print(f"    [cross] mutual={n_mut:,} asym={n_asym:,} "
+              f"total(去重前)={len(src):,}  ({time.time()-t0:.1f}s)")
+        print(f"    [cross] mutual rate {mut_rate:.1%}  "
+              f"(asym 边保证每节点至少 {k_asym} 条跨域连接)")
+
+    return src, dst
 
 # ══════════════════════════════════════════════════════════════════
 # 6. 构建联合图（融合：PCA 已对齐 + MNN 跨域边）
@@ -391,19 +467,15 @@ def build_spot_graph(
 
     # (c) 跨域 MNN — 路线 B 关键
     if verbose: print(f"\n  [3/4] 跨域 mutual NN  (k={k_cross})  ★")
-    src_ca, dst_cb = _mutual_cross_knn(Xs, Xx, k=k_cross, verbose=verbose)
-    if len(src_ca) == 0:
-        warnings.warn(
-            "Cross-domain MNN found 0 edges. "
-            "PCA 对齐后两域分布可能仍偏差严重。"
-            "Fallback: 每个 spot 强制连最近的 scRNA。"
-        )
-        nbrs = NearestNeighbors(n_neighbors=1, algorithm="kd_tree",
-                                n_jobs=-1).fit(Xs)
-        _, idx = nbrs.kneighbors(Xx)
-        src_ca = idx[:, 0].astype(np.int64)
-        dst_cb = np.arange(len(Xx), dtype=np.int64)
-    src_c = src_ca                  # scRNA 全局 = 局部
+    # (c) 跨域边（mutual + 双向 asymmetric）
+    if verbose: print(f"\n  [3/4] 跨域边  (k_mutual={k_cross}, k_asym={k_cross})  ★")
+    src_ca, dst_cb = _cross_domain_edges(
+        Xs, Xx,
+        k_mutual=k_cross,
+        k_asym=k_cross,
+        verbose=verbose,
+    )
+    src_c = src_ca
     dst_c = dst_cb + n_scrna
 
     # (d) spot 空间
@@ -451,9 +523,11 @@ def build_spot_graph(
     # 类权重
     if verbose: print(f"\n  计算类别权重 (cap={max_weight_multiplier}×) …")
     class_weights = compute_capped_class_weights(
-        scrna_labels, max_weight_multiplier=max_weight_multiplier,
-        verbose=verbose,
-    )
+    scrna_labels,
+    max_weight_multiplier=max_weight_multiplier,
+    min_weight=1.0,                                    # ← 修改处：显式传 1.0
+    verbose=verbose,
+    )   
 
     # 组装
     X_all = np.vstack([scrna_norm, spot_norm])
