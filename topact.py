@@ -45,10 +45,12 @@ class TopACT:
         self.n_neighbors    = n_neighbors
         self.seed           = seed
 
+        # 修改后
         self.svm     = SVC(
             C=C, gamma=gamma, kernel=kernel,
             probability=True, random_state=seed,
             class_weight="balanced",
+            cache_size=2000,                 # ← 修改处：核缓存 2GB（默认 200MB），减少重复核计算
         )
         self.scaler  = None
         self.classes_ = None
