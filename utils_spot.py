@@ -47,16 +47,19 @@ from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.utils.class_weight import compute_class_weight
 
-
 # ══════════════════════════════════════════════════════════════════
 # 1. 加载 / binning（与 v3/v4 一致）
 # ══════════════════════════════════════════════════════════════════
 
+
 def load_xenium_transcripts(transcript_path, gene_list, qv_threshold=20, verbose=True):
     if verbose:
         print(f"加载转录本文件: {transcript_path}")
-    df = pd.read_parquet(transcript_path) if transcript_path.endswith(".parquet") \
-         else pd.read_csv(transcript_path)
+    df = (
+        pd.read_parquet(transcript_path)
+        if transcript_path.endswith(".parquet")
+        else pd.read_csv(transcript_path)
+    )
     if verbose:
         print(f"  原始转录本数: {len(df):,}")
 
@@ -87,7 +90,9 @@ def load_xenium_transcripts(transcript_path, gene_list, qv_threshold=20, verbose
     return df[["gene", "x", "y"]].copy()
 
 
-def bin_transcripts_to_spots(df, gene_list, bin_size=10, min_transcripts=1, verbose=True):
+def bin_transcripts_to_spots(
+    df, gene_list, bin_size=10, min_transcripts=1, verbose=True
+):
     df = df.copy()
     df["bx"] = (df["x"] // bin_size) * bin_size + bin_size // 2
     df["by"] = (df["y"] // bin_size) * bin_size + bin_size // 2
@@ -103,8 +108,10 @@ def bin_transcripts_to_spots(df, gene_list, bin_size=10, min_transcripts=1, verb
 
     n_spots, n_genes = len(spot_key), len(gene_list)
     spot_matrix = sp.coo_matrix(
-        (np.ones(len(df), dtype=np.float32),
-         (df["spot_id"].values, df["gene_idx"].values)),
+        (
+            np.ones(len(df), dtype=np.float32),
+            (df["spot_id"].values, df["gene_idx"].values),
+        ),
         shape=(n_spots, n_genes),
     ).tocsr()
 
@@ -118,7 +125,9 @@ def bin_transcripts_to_spots(df, gene_list, bin_size=10, min_transcripts=1, verb
         print(f"  bin_size={bin_size}μm -> {spot_expr.shape[0]:,} 个有效 spot")
         print(f"  特征维度: {spot_expr.shape[1]}")
         print(f"  每 spot 平均转录本数: {lib.mean():.1f}  (中位 {np.median(lib):.1f})")
-        print(f"  scRNA 典型 ~10000 → 比值 {10000/max(lib.mean(),1):.0f}x （域偏移源头）")
+        print(
+            f"  scRNA 典型 ~10000 → 比值 {10000/max(lib.mean(),1):.0f}x （域偏移源头）"
+        )
 
     return spot_expr, spot_coords
 
@@ -126,6 +135,7 @@ def bin_transcripts_to_spots(df, gene_list, bin_size=10, min_transcripts=1, verb
 # ══════════════════════════════════════════════════════════════════
 # 2. 归一化
 # ══════════════════════════════════════════════════════════════════
+
 
 def log_normalize(X, scale_factor=1e4):
     """Library-size normalization + log1p。"""
@@ -141,19 +151,21 @@ def unified_normalize_spot(scrna_expr, spot_expr):
     warnings.warn(
         "unified_normalize_spot() 无法修复域偏移；GNN 训练请使用 "
         "prepare_features_for_gnn()。本函数仅供 TopACT SVM 使用。",
-        UserWarning, stacklevel=2,
+        UserWarning,
+        stacklevel=2,
     )
     scrna_log = log_normalize(scrna_expr)
-    spot_log  = log_normalize(spot_expr)
+    spot_log = log_normalize(spot_expr)
     scaler = StandardScaler()
     scrna_norm = scaler.fit_transform(scrna_log).astype(np.float32)
-    spot_norm  = scaler.transform(spot_log).astype(np.float32)
+    spot_norm = scaler.transform(spot_log).astype(np.float32)
     return scrna_norm, spot_norm, scaler
 
 
 # ══════════════════════════════════════════════════════════════════
 # 3. 路线 A：PCA 跨域对齐（域偏移核心修复）
 # ══════════════════════════════════════════════════════════════════
+
 
 def pca_align_features(
     scrna_lognorm,
@@ -179,41 +191,51 @@ def pca_align_features(
         xenium_clipped = np.clip(xenium_lognorm, None, clip_vals)
         if verbose:
             pct = 100.0 * n_clipped / xenium_lognorm.size
-            print(f"    [PCA] Xenium 裁剪: {n_clipped:,} 值 ({pct:.2f}%) "
-                  f"超 scRNA {clip_percentile}th pct")
+            print(
+                f"    [PCA] Xenium 裁剪: {n_clipped:,} 值 ({pct:.2f}%) "
+                f"超 scRNA {clip_percentile}th pct"
+            )
     else:
         xenium_clipped = xenium_lognorm.copy()
 
     # Step 2: scRNA 上 fit PCA
     n_comp = min(n_components, min(scrna_lognorm.shape) - 1)
     if verbose:
-        print(f"    [PCA] 在 {scrna_lognorm.shape[0]:,} scRNA 细胞上 fit "
-              f"PCA(n_components={n_comp})…")
+        print(
+            f"    [PCA] 在 {scrna_lognorm.shape[0]:,} scRNA 细胞上 fit "
+            f"PCA(n_components={n_comp})…"
+        )
     t0 = time.time()
     pca = PCA(n_components=n_comp, random_state=42)
     scrna_pca = pca.fit_transform(scrna_lognorm)
     if verbose:
-        print(f"    [PCA] 解释方差: {pca.explained_variance_ratio_.sum():.3f}  "
-              f"({time.time()-t0:.1f}s)")
+        print(
+            f"    [PCA] 解释方差: {pca.explained_variance_ratio_.sum():.3f}  "
+            f"({time.time()-t0:.1f}s)"
+        )
 
     # Step 3: 投影 Xenium
     xenium_pca = pca.transform(xenium_clipped)
     if verbose:
         print(f"    [PCA] {scrna_lognorm.shape[1]} → {n_comp} dims")
-        print(f"    [PCA] scRNA  PC range: [{scrna_pca.min():+.2f}, {scrna_pca.max():+.2f}]")
-        print(f"    [PCA] Xenium PC range: [{xenium_pca.min():+.2f}, {xenium_pca.max():+.2f}]")
+        print(
+            f"    [PCA] scRNA  PC range: [{scrna_pca.min():+.2f}, {scrna_pca.max():+.2f}]"
+        )
+        print(
+            f"    [PCA] Xenium PC range: [{xenium_pca.min():+.2f}, {xenium_pca.max():+.2f}]"
+        )
 
         # 诊断：两域在 PC1-PC2 上的均值距离（看分布是否真重叠）
         d12_sc = scrna_pca[:, :2].mean(axis=0)
         d12_xe = xenium_pca[:, :2].mean(axis=0)
         gap = float(np.linalg.norm(d12_sc - d12_xe))
         sc_std = float(np.linalg.norm(scrna_pca[:, :2].std(axis=0)))
-        print(f"    [PCA] PC1-PC2 域均值差: {gap:.2f}  vs scRNA std: {sc_std:.2f}  "
-              f"(差/std 比 {gap/max(sc_std,1e-6):.2f}, <1 健康)")
+        print(
+            f"    [PCA] PC1-PC2 域均值差: {gap:.2f}  vs scRNA std: {sc_std:.2f}  "
+            f"(差/std 比 {gap/max(sc_std,1e-6):.2f}, <1 健康)"
+        )
 
-    return (scrna_pca.astype(np.float32),
-            xenium_pca.astype(np.float32),
-            pca)
+    return (scrna_pca.astype(np.float32), xenium_pca.astype(np.float32), pca)
 
 
 def prepare_features_for_gnn(
@@ -231,22 +253,26 @@ def prepare_features_for_gnn(
     if verbose:
         sc_lib = scrna_counts.sum(axis=1)
         sp_lib = spot_counts.sum(axis=1)
-        ratio  = sc_lib.mean() / max(sp_lib.mean(), 1)
+        ratio = sc_lib.mean() / max(sp_lib.mean(), 1)
         print(f"  scRNA 文库: 中位 {np.median(sc_lib):.0f}  均值 {sc_lib.mean():.0f}")
         print(f"  spot  文库: 中位 {np.median(sp_lib):.0f}  均值 {sp_lib.mean():.0f}")
-        print(f"  文库比 {ratio:.0f}x → log-norm 后差 ~{np.log1p(ratio):.1f}x（PCA 前）")
+        print(
+            f"  文库比 {ratio:.0f}x → log-norm 后差 ~{np.log1p(ratio):.1f}x（PCA 前）"
+        )
 
-    if verbose: print("  Step 1/2: log_normalize …")
+    if verbose:
+        print("  Step 1/2: log_normalize …")
     scrna_log = log_normalize(scrna_counts.astype(np.float32))
-    spot_log  = log_normalize(spot_counts.astype(np.float32))
+    spot_log = log_normalize(spot_counts.astype(np.float32))
 
-    if verbose: print(f"  Step 2/2: pca_align_features (n_pca={n_pca}) …")
+    if verbose:
+        print(f"  Step 2/2: pca_align_features (n_pca={n_pca}) …")
     scrna_pca, spot_pca, pca_model = pca_align_features(
-        scrna_lognorm  = scrna_log,
-        xenium_lognorm = spot_log,
-        n_components   = n_pca,
-        clip_percentile= clip_percentile,
-        verbose        = verbose,
+        scrna_lognorm=scrna_log,
+        xenium_lognorm=spot_log,
+        n_components=n_pca,
+        clip_percentile=clip_percentile,
+        verbose=verbose,
     )
     if verbose:
         print(f"  ✅ 特征准备完成: {scrna_counts.shape[1]} genes → {n_pca} PCA dims")
@@ -257,11 +283,12 @@ def prepare_features_for_gnn(
 # 4. 类权重 cap
 # ══════════════════════════════════════════════════════════════════
 
+
 def compute_capped_class_weights(
     labels,
     max_weight_multiplier: float = 5.0,
-    min_weight:            float = 1.0,
-    verbose:               bool  = True,
+    min_weight: float = 1.0,
+    verbose: bool = True,
 ):
     """
     修改：增加 min_weight 下限。原 normed/mean 后多数类权重 < 1，
@@ -275,9 +302,11 @@ def compute_capped_class_weights(
     capped = np.clip(normed, min_weight, max_weight_multiplier)
 
     if verbose:
-        print(f"    [权重] {len(classes)} 类 | raw [{raw.min():.2f}, {raw.max():.2f}] | "
-              f"capped [{capped.min():.2f}, {capped.max():.2f}] "
-              f"(范围 [{min_weight}, {max_weight_multiplier}]×)")
+        print(
+            f"    [权重] {len(classes)} 类 | raw [{raw.min():.2f}, {raw.max():.2f}] | "
+            f"capped [{capped.min():.2f}, {capped.max():.2f}] "
+            f"(范围 [{min_weight}, {max_weight_multiplier}]×)"
+        )
 
     weight_vec = np.ones(n_classes, dtype=np.float32)
     for c, w in zip(classes, capped):
@@ -289,13 +318,14 @@ def compute_capped_class_weights(
 # 5. kNN 内部工具
 # ══════════════════════════════════════════════════════════════════
 
+
 def _intra_knn(X, k, label="", verbose=True):
     """单域内 kNN（不含跨域边）。返回局部 (src, dst)。"""
     n = len(X)
     if verbose:
         print(f"    [{label}] intra kd_tree k={k}, n={n:,}, dim={X.shape[1]} …")
     t0 = time.time()
-    nbrs = NearestNeighbors(n_neighbors=k+1, algorithm="kd_tree", n_jobs=-1).fit(X)
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="kd_tree", n_jobs=-1).fit(X)
     _, idx = nbrs.kneighbors(X)
     if verbose:
         print(f"    [{label}] done {time.time()-t0:.1f}s")
@@ -318,10 +348,14 @@ def _mutual_cross_knn(X_a, X_b, k=10, verbose=True):
     n_a, n_b = len(X_a), len(X_b)
     k_eff = min(k, n_a, n_b)
 
-    nbrs_b = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree", n_jobs=-1).fit(X_b)
+    nbrs_b = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree", n_jobs=-1).fit(
+        X_b
+    )
     _, idx_a2b = nbrs_b.kneighbors(X_a)
 
-    nbrs_a = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree", n_jobs=-1).fit(X_a)
+    nbrs_a = NearestNeighbors(n_neighbors=k_eff, algorithm="kd_tree", n_jobs=-1).fit(
+        X_a
+    )
     _, idx_b2a = nbrs_a.kneighbors(X_b)
 
     # mutual 判断
@@ -332,48 +366,62 @@ def _mutual_cross_knn(X_a, X_b, k=10, verbose=True):
     for i in range(n_a):
         for j in b_set_of_a[i]:
             if i in a_set_of_b[j]:
-                src.append(i); dst.append(j)
+                src.append(i)
+                dst.append(j)
 
     if verbose:
         sym = len(src) / max(n_a * k_eff, 1)
-        print(f"    [cross MNN] k={k_eff}: {len(src):,} edges in "
-              f"{time.time()-t0:.1f}s (mutual rate {sym:.1%})")
+        print(
+            f"    [cross MNN] k={k_eff}: {len(src):,} edges in "
+            f"{time.time()-t0:.1f}s (mutual rate {sym:.1%})"
+        )
     return np.array(src, dtype=np.int64), np.array(dst, dtype=np.int64)
+
 
 # ══════════════════════════════════════════════════════════════════
 # 5b. 修复版跨域边构造（mutual + 双向 asymmetric）
 # ══════════════════════════════════════════════════════════════════
 
+
 def _cross_domain_edges(
-    X_a, X_b,
+    X_a,
+    X_b,
     k_mutual: int = 10,
-    k_asym:   int = 10,
-    verbose:  bool = True,
+    k_asym_a2b: int = 10,  # ← 修改处：cell → spot 方向
+    k_asym_b2a: int = 5,  # ← 修改处：spot → cell 方向（小，防 18:1 规模放大）
+    k_asym: int | None = None,  # ← 修改处：兼容旧调用，内部映射
+    verbose: bool = True,
 ):
     """
-    [新增] 跨域边构造，修复纯 mutual NN 在域规模不对称时的稀疏问题。
+    [修改] 拆分 k_asym 为两个方向，避免 18:1 规模不对称下 spot→cell 边爆炸。
 
-    输出三类边的并集（去重在 build_spot_graph 末尾统一做）：
-      1. mutual NN（高质量但稀疏）
-      2. cell  → spot top-k_asym（保证每个 cell 至少 k_asym 条跨域边）
-      3. spot → cell top-k_asym（保证每个 spot 至少 k_asym 条跨域边）
+    规模分析（n_a=16569 cell, n_b=298053 spot）：
+      a2b 边数 = n_a * k_asym_a2b
+      b2a 边数 = n_b * k_asym_b2a   ← 这一项主导，用小 k
 
-    覆盖率分析（k_asym=10, n_a=16569, n_b=298053）：
-      asym 边数 = n_a*k_asym + n_b*k_asym = 165K + 2.98M = ~3.15M
-      占总边比 ≈ 3.15M / (16M base + 3.15M cross) ≈ 16%   ✅ 健康区间
+    旧调用兼容：
+      传 k_asym 时，两个方向都用同一个值（旧行为）。
+      新代码请显式传 k_asym_a2b / k_asym_b2a。
     """
+    # 兼容旧调用
+    if k_asym is not None:
+        k_asym_a2b = k_asym
+        k_asym_b2a = k_asym
+
     t0 = time.time()
     n_a, n_b = len(X_a), len(X_b)
-    k_max = min(max(k_mutual, k_asym), n_a, n_b)
+    k_max = min(max(k_mutual, k_asym_a2b, k_asym_b2a), n_a, n_b)
 
     # 一次性查询 max(k_mutual, k_asym) 个邻居，复用结果
-    nbrs_b = NearestNeighbors(n_neighbors=k_max, algorithm="kd_tree",
-                              n_jobs=-1).fit(X_b)
-    _, idx_a2b = nbrs_b.kneighbors(X_a)        # cell  → spot
+    nbrs_b = NearestNeighbors(n_neighbors=k_max, algorithm="kd_tree", n_jobs=-1).fit(
+        X_b
+    )
+    _, idx_a2b = nbrs_b.kneighbors(X_a)  # cell  → spot
 
-    nbrs_a = NearestNeighbors(n_neighbors=k_max, algorithm="kd_tree",
-                              n_jobs=-1).fit(X_a)
-    _, idx_b2a = nbrs_a.kneighbors(X_b)        # spot → cell
+    nbrs_a = NearestNeighbors(n_neighbors=k_max, algorithm="kd_tree", n_jobs=-1).fit(
+        X_a
+    )
+    _, idx_b2a = nbrs_a.kneighbors(X_b)  # spot → cell
 
     src_list, dst_list = [], []
 
@@ -386,17 +434,19 @@ def _cross_domain_edges(
     for i in range(n_a):
         for j in b_set_of_a[i]:
             if i in a_set_of_b[j]:
-                src_list.append(i); dst_list.append(j); n_mut += 1
+                src_list.append(i)
+                dst_list.append(j)
+                n_mut += 1
 
-    # 2. cell → spot 单向 top-k_asym ────────────────────────
-    a2b_a = idx_a2b[:, :k_asym]
-    src_list.extend(np.repeat(np.arange(n_a), k_asym).tolist())
+    # 2. cell → spot 单向 top-k_asym_a2b ────────────────────
+    a2b_a = idx_a2b[:, :k_asym_a2b]
+    src_list.extend(np.repeat(np.arange(n_a), k_asym_a2b).tolist())
     dst_list.extend(a2b_a.ravel().tolist())
 
-    # 3. spot → cell 单向 top-k_asym ────────────────────────
-    b2a_a = idx_b2a[:, :k_asym]
+    # 3. spot → cell 单向 top-k_asym_b2a ────────────────────
+    b2a_a = idx_b2a[:, :k_asym_b2a]
     src_list.extend(b2a_a.ravel().tolist())
-    dst_list.extend(np.repeat(np.arange(n_b), k_asym).tolist())
+    dst_list.extend(np.repeat(np.arange(n_b), k_asym_b2a).tolist())
 
     src = np.array(src_list, dtype=np.int64)
     dst = np.array(dst_list, dtype=np.int64)
@@ -404,25 +454,31 @@ def _cross_domain_edges(
     if verbose:
         n_asym = len(src) - n_mut
         mut_rate = n_mut / max(n_a * k_mutual, 1)
-        print(f"    [cross] mutual={n_mut:,} asym={n_asym:,} "
-              f"total(去重前)={len(src):,}  ({time.time()-t0:.1f}s)")
-        print(f"    [cross] mutual rate {mut_rate:.1%}  "
-              f"(asym 边保证每节点至少 {k_asym} 条跨域连接)")
+        print(
+            f"    [cross] mutual={n_mut:,} asym={n_asym:,} "
+            f"total(去重前)={len(src):,}  ({time.time()-t0:.1f}s)"
+        )
+        print(
+            f"    [cross] mutual rate {mut_rate:.1%}  "
+            f"(asym 边保证每节点至少 {k_asym} 条跨域连接)"
+        )
 
     return src, dst
+
 
 # ══════════════════════════════════════════════════════════════════
 # 6. 构建联合图（融合：PCA 已对齐 + MNN 跨域边）
 # ══════════════════════════════════════════════════════════════════
 
+
 def build_spot_graph(
-    scrna_norm,            # 已 PCA 对齐的 scRNA 特征 (n_scrna, 50)
-    spot_norm,             # 已 PCA 对齐的 spot 特征  (n_spots, 50)
+    scrna_norm,  # 已 PCA 对齐的 scRNA 特征 (n_scrna, 50)
+    spot_norm,  # 已 PCA 对齐的 spot 特征  (n_spots, 50)
     spot_coords,
     scrna_labels,
     k_feat: int = 15,
     k_spatial: int = 10,
-    k_cross: int = 10,                   # ← 跨域 MNN 的 k
+    k_cross: int = 10,  # ← 跨域 MNN 的 k
     val_ratio: float = 0.2,
     max_weight_multiplier: float = 5.0,
     verbose: bool = True,
@@ -446,50 +502,57 @@ def build_spot_graph(
     if verbose:
         feat_dim = scrna_norm.shape[1]
         print(f"  scRNA: {n_scrna:,}  |  spot: {n_spots:,}  |  total: {n_total:,}")
-        print(f"  特征维度: {feat_dim}  内存: "
-              f"{n_total*feat_dim*4/1024**2:.0f} MB")
+        print(f"  特征维度: {feat_dim}  内存: " f"{n_total*feat_dim*4/1024**2:.0f} MB")
         if feat_dim > 100:
-            print(f"  ⚠  特征维度 {feat_dim} 较大，建议先调用 prepare_features_for_gnn() "
-                  f"得到 50d PCA 特征")
+            print(
+                f"  ⚠  特征维度 {feat_dim} 较大，建议先调用 prepare_features_for_gnn() "
+                f"得到 50d PCA 特征"
+            )
 
     Xs = scrna_norm
     Xx = spot_norm
 
     # (a) scRNA-内
-    if verbose: print(f"\n  [1/4] scRNA-内 kNN  (k={k_feat})")
+    if verbose:
+        print(f"\n  [1/4] scRNA-内 kNN  (k={k_feat})")
     src_s, dst_s = _intra_knn(Xs, k=k_feat, label="scRNA", verbose=verbose)
 
     # (b) spot-内
-    if verbose: print(f"\n  [2/4] spot-内 kNN  (k={k_feat})")
+    if verbose:
+        print(f"\n  [2/4] spot-内 kNN  (k={k_feat})")
     src_x, dst_x = _intra_knn(Xx, k=k_feat, label="spot", verbose=verbose)
     src_x = src_x + n_scrna
     dst_x = dst_x + n_scrna
 
     # (c) 跨域 MNN — 路线 B 关键
-    if verbose: print(f"\n  [3/4] 跨域 mutual NN  (k={k_cross})  ★")
+    if verbose:
+        print(f"\n  [3/4] 跨域 mutual NN  (k={k_cross})  ★")
     # (c) 跨域边（mutual + 双向 asymmetric）
-    if verbose: print(f"\n  [3/4] 跨域边  (k_mutual={k_cross}, k_asym={k_cross})  ★")
-    src_ca, dst_cb = _cross_domain_edges(
-        Xs, Xx,
+    if verbose:
+        print(f"\n  [3/4] 跨域边  (k_mutual={k_cross}, k_asym={k_cross})  ★")
+    src_ca, dst_cb = _cross_domain_edges(  # ← 修改处
+        Xs,
+        Xx,
         k_mutual=k_cross,
-        k_asym=k_cross,
+        k_asym_a2b=k_cross,  # cell→spot：与 k_cross 同步
+        k_asym_b2a=max(3, k_cross // 4),  # spot→cell：18:1 规模下减为 1/4
         verbose=verbose,
     )
     src_c = src_ca
     dst_c = dst_cb + n_scrna
 
     # (d) spot 空间
-    if verbose: print(f"\n  [4/4] spot 空间 kNN  (k={k_spatial})")
+    if verbose:
+        print(f"\n  [4/4] spot 空间 kNN  (k={k_spatial})")
     src_sp, dst_sp = _spatial_knn(spot_coords, k=k_spatial, verbose=verbose)
     src_sp = src_sp + n_scrna
     dst_sp = dst_sp + n_scrna
 
     # 合并 + 双向 + 去重
-    if verbose: print(f"\n  合并 4 类边集 …")
-    src_all = np.concatenate([src_s, dst_s, src_x, dst_x,
-                              src_c, dst_c, src_sp, dst_sp])
-    dst_all = np.concatenate([dst_s, src_s, dst_x, src_x,
-                              dst_c, src_c, dst_sp, src_sp])
+    if verbose:
+        print(f"\n  合并 4 类边集 …")
+    src_all = np.concatenate([src_s, dst_s, src_x, dst_x, src_c, dst_c, src_sp, dst_sp])
+    dst_all = np.concatenate([dst_s, src_s, dst_x, src_x, dst_c, src_c, dst_sp, src_sp])
     edges = np.unique(np.stack([src_all, dst_all], 1), axis=0)
     edges = edges[edges[:, 0] != edges[:, 1]]
     edge_index = torch.from_numpy(edges.T).long()
@@ -514,30 +577,31 @@ def build_spot_graph(
     train_local, val_local = next(sss.split(np.arange(n_scrna), scrna_labels))
 
     train_mask = torch.zeros(n_total, dtype=torch.bool)
-    val_mask   = torch.zeros(n_total, dtype=torch.bool)
-    spot_mask  = torch.zeros(n_total, dtype=torch.bool)
+    val_mask = torch.zeros(n_total, dtype=torch.bool)
+    spot_mask = torch.zeros(n_total, dtype=torch.bool)
     train_mask[train_local] = True
-    val_mask[val_local]     = True
-    spot_mask[n_scrna:]     = True
+    val_mask[val_local] = True
+    spot_mask[n_scrna:] = True
 
     # 类权重
-    if verbose: print(f"\n  计算类别权重 (cap={max_weight_multiplier}×) …")
+    if verbose:
+        print(f"\n  计算类别权重 (cap={max_weight_multiplier}×) …")
     class_weights = compute_capped_class_weights(
-    scrna_labels,
-    max_weight_multiplier=max_weight_multiplier,
-    min_weight=1.0,                                    # ← 修改处：显式传 1.0
-    verbose=verbose,
-    )   
+        scrna_labels,
+        max_weight_multiplier=max_weight_multiplier,
+        min_weight=1.0,  # ← 修改处：显式传 1.0
+        verbose=verbose,
+    )
 
     # 组装
     X_all = np.vstack([scrna_norm, spot_norm])
     data = Data(
-        x          = torch.from_numpy(X_all).float(),
-        edge_index = edge_index,
-        y          = torch.from_numpy(labels_all).long(),
-        train_mask = train_mask,
-        val_mask   = val_mask,
-        spot_mask  = spot_mask,
+        x=torch.from_numpy(X_all).float(),
+        edge_index=edge_index,
+        y=torch.from_numpy(labels_all).long(),
+        train_mask=train_mask,
+        val_mask=val_mask,
+        spot_mask=spot_mask,
     )
     data.xenium_mask = spot_mask
     data.n_scrna = n_scrna
@@ -545,10 +609,10 @@ def build_spot_graph(
 
     split_info = {
         "train_idx": train_local,
-        "val_idx":   val_local,
-        "n_scrna":   n_scrna,
-        "n_spots":   n_spots,
-        "cross_edge_pct": cross_pct,    # ← 健康度指标
+        "val_idx": val_local,
+        "n_scrna": n_scrna,
+        "n_spots": n_spots,
+        "cross_edge_pct": cross_pct,  # ← 健康度指标
         "n_edges": n_edges,
         "n_cross_edges": n_cross,
     }
@@ -556,8 +620,10 @@ def build_spot_graph(
     if verbose:
         elapsed = time.time() - t_total
         print(f"\n  ✅ 图构建完成 {elapsed:.1f}s ({elapsed/60:.1f} min)")
-        print(f"     train {train_mask.sum():,}  val {val_mask.sum():,}  "
-              f"spot {spot_mask.sum():,}")
+        print(
+            f"     train {train_mask.sum():,}  val {val_mask.sum():,}  "
+            f"spot {spot_mask.sum():,}"
+        )
 
     return data, class_weights, split_info
 
@@ -566,13 +632,14 @@ def build_spot_graph(
 # 7. spot → 细胞质心聚合（radius 自适应）
 # ══════════════════════════════════════════════════════════════════
 
+
 def aggregate_spot_to_cell(
     spot_proba,
     spot_coords,
     cell_coords,
     n_classes,
     bin_size: float = 10.0,
-    radius_um: float = None,    # None → bin_size * 2.5
+    radius_um: float = None,  # None → bin_size * 2.5
 ):
     """
     bin_size  : spot 的 bin 大小（μm）
@@ -600,8 +667,10 @@ def aggregate_spot_to_cell(
 
     if n_fb > 0:
         pct = 100.0 * n_fb / len(cell_coords)
-        print(f"  [聚合] 最近邻回退 {n_fb:,} ({pct:.1f}%)  "
-              f"(radius={radius_um:.1f}μm, bin={bin_size}μm)")
+        print(
+            f"  [聚合] 最近邻回退 {n_fb:,} ({pct:.1f}%)  "
+            f"(radius={radius_um:.1f}μm, bin={bin_size}μm)"
+        )
         if pct > 10:
             print(f"     建议 radius 增加到 {radius_um*1.5:.0f}–{radius_um*2:.0f}")
 
